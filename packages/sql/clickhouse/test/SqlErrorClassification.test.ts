@@ -25,7 +25,8 @@ vi.mock("@clickhouse/client", () => ({
       state.queryCause
         ? Promise.reject(state.queryCause)
         : Promise.resolve({
-          json: () => state.resultJsonCause ? Promise.reject(state.resultJsonCause) : Promise.resolve({ data: [] })
+          json: () => state.resultJsonCause ? Promise.reject(state.resultJsonCause) : Promise.resolve({ data: [] }),
+          text: () => state.resultJsonCause ? Promise.reject(state.resultJsonCause) : Promise.resolve(`{"data":[]}`)
         }),
     command: () => Promise.resolve({}),
     insert: () => Promise.resolve({})
