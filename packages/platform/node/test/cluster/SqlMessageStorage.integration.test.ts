@@ -1,4 +1,5 @@
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
+import { ClickhouseClient, ClickhouseMessageStorage } from "@effect/sql-clickhouse"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, expect, it } from "@effect/vitest"
 import { Effect, Exit, Fiber, FileSystem, Latch, Layer, Option } from "effect"
@@ -21,6 +22,7 @@ import {
 } from "effect/cluster"
 import { SqlClient } from "effect/sql"
 import { TestClock } from "effect/testing"
+import { ClickhouseContainer } from "../fixtures/clickhouse-utils.ts"
 import { MysqlContainer } from "../fixtures/mysql2-utils.ts"
 import { PgContainer } from "../fixtures/pg-utils.ts"
 import {
@@ -50,14 +52,117 @@ const truncate = Effect.gen(function*() {
   yield* sql`DELETE FROM cluster_messages`
 })
 
+// What the shared tests need to know about a backend's schema.
+interface Backend {
+  readonly label: string
+  readonly layer: Layer.Layer<MessageStorage.MessageStorage | Snowflake.Generator | SqlClient.SqlClient>
+  readonly truncate: Effect.Effect<void, unknown, SqlClient.SqlClient>
+  // The processed state of every message, in insertion order.
+  readonly processedStates: Effect.Effect<unknown, unknown, SqlClient.SqlClient>
+  // The processed state and latest reply of one message.
+  readonly messageState: (id: string) => Effect.Effect<unknown, unknown, SqlClient.SqlClient>
+  // The stored request deduplication keys.
+  readonly storedMessageIds: Effect.Effect<ReadonlyArray<string>, unknown, SqlClient.SqlClient>
+  readonly makeEncoded: Effect.Effect<MessageStorage.Encoded, never, SqlClient.SqlClient>
+}
+
+const sqlBackend = (
+  label: string,
+  layer: Layer.Layer<SqlClient.SqlClient>
+): Backend => ({
+  label,
+  layer: StorageLayer.pipe(Layer.provideMerge(layer)),
+  truncate,
+  processedStates: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`
+  }),
+  messageState: (id) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${id}`.pipe(
+        Effect.provideService(SqlClient.SafeIntegers, true)
+      )
+    }),
+  storedMessageIds: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
+    return rows.map((row) => row.message_id)
+  }),
+  makeEncoded: SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+})
+
+const clickhouseTables = ["messages", "replies", "reply_acks", "message_ids", "pending", "exits"]
+
+// A message is processed once it has left the pending table, or once its
+// request has an exit.
+const clickhouseBackend: Backend = {
+  label: "clickhouse",
+  layer: ClickhouseMessageStorage.layer.pipe(
+    Layer.provideMerge(Snowflake.layerGenerator),
+    Layer.provide([ShardingConfig.layerDefaults, NodeCrypto.layer]),
+    Layer.provideMerge(Layer.orDie(ClickhouseContainer.layerClient))
+  ),
+  truncate: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    for (const table of clickhouseTables) {
+      yield* sql`TRUNCATE TABLE ${sql(`cluster_${table}`)}`.pipe(
+        Effect.provideService(ClickhouseClient.ClientMethod, "command")
+      )
+    }
+  }),
+  processedStates: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql`
+      SELECT
+        id NOT IN (SELECT id FROM cluster_pending)
+          OR request_id IN (SELECT request_id FROM cluster_exits) AS processed
+      FROM cluster_messages
+      ORDER BY rowid
+    `
+  }),
+  messageState: (id) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const pending = yield* sql<{ last_reply_id: string | null }>`
+        SELECT last_reply_id FROM cluster_pending WHERE id = ${sql.literal(id)}
+      `
+      const exits = yield* sql<{ reply_id: string }>`
+        SELECT reply_id FROM cluster_exits WHERE request_id = ${sql.literal(id)}
+      `
+      return {
+        processed: pending.length === 0 || exits.length > 0,
+        last_reply_id: exits[0]?.reply_id ?? pending[0]?.last_reply_id ?? null
+      }
+    }).pipe(
+      // Read Snowflake ids exactly, as strings.
+      Effect.provideService(ClickhouseClient.ClickhouseSettings, { output_format_json_quote_64bit_integers: 1 })
+    ),
+  storedMessageIds: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_message_ids`
+    return rows.map((row) => row.message_id)
+  }),
+  // The ClickHouse client layer provides the same client as `SqlClient`.
+  makeEncoded: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* ClickhouseMessageStorage.makeEncoded().pipe(
+      Effect.provideService(ClickhouseClient.ClickhouseClient, sql as ClickhouseClient.ClickhouseClient),
+      Effect.provide(NodeCrypto.layer)
+    )
+  })
+}
+
 describe("SqlMessageStorage", () => {
-  ;([
-    ["pg", Layer.orDie(PgContainer.layerClient)],
-    ["mysql", Layer.orDie(MysqlContainer.layerClient)],
-    ["sqlite", Layer.orDie(SqliteLayer)]
-  ] as const).forEach(([label, layer]) => {
+  ;[
+    sqlBackend("pg", Layer.orDie(PgContainer.layerClient)),
+    sqlBackend("mysql", Layer.orDie(MysqlContainer.layerClient)),
+    sqlBackend("sqlite", Layer.orDie(SqliteLayer)),
+    clickhouseBackend
+  ].forEach((backend) => {
+    const { label } = backend
     // Tests truncate this backend's shared tables.
-    it.layer(StorageLayer.pipe(Layer.provideMerge(layer)), {
+    it.layer(backend.layer, {
       concurrent: false,
       timeout: 120000
     })(label, (it) => {
@@ -65,9 +170,9 @@ describe("SqlMessageStorage", () => {
         for (const reset of ["resetShards", "resetAddresses"] as const) {
           it.effect(`${reset} does not deadlock with a concurrent message claim`, () =>
             Effect.gen(function*() {
-              yield* truncate
+              yield* backend.truncate
               const sql = yield* SqlClient.SqlClient
-              const storage = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+              const storage = yield* backend.makeEncoded
               // Heap order is the reverse of the claim query's rowid order.
               yield* sql`
                 INSERT INTO cluster_messages
@@ -124,7 +229,7 @@ describe("SqlMessageStorage", () => {
                 Effect.gen(function*() {
                   yield* sql`DROP TRIGGER cluster_test_slow_reset ON cluster_messages`
                   yield* sql`DROP FUNCTION cluster_test_slow_reset()`
-                  yield* truncate
+                  yield* backend.truncate
                 }).pipe(Effect.orDie)
               ))
             }).pipe(TestClock.withLive))
@@ -143,9 +248,54 @@ describe("SqlMessageStorage", () => {
           }))
       }
 
+      if (label === "clickhouse") {
+        it.effect("concurrent readers never claim the same message", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const encoded = yield* backend.makeEncoded
+            const shardId = ShardId.make("default", 1).toString()
+            for (let i = 1; i <= 20; i++) {
+              yield* storage.saveRequest(yield* makeRequest({ payload: { id: i }, entityId: String(i) }))
+            }
+            const reads = yield* Effect.all(
+              Array.from({ length: 4 }, () => encoded.unprocessedMessages([shardId], Date.now())),
+              { concurrency: "unbounded" }
+            )
+            const claimed = reads.flat().map((message) =>
+              message.envelope._tag === "Request" ? message.envelope.requestId : message.envelope.id
+            )
+            expect(claimed).toHaveLength(20)
+            expect(new Set(claimed).size).toEqual(20)
+          }))
+
+        it.effect("concurrent saves of one primary key keep a single request", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const requests = yield* Effect.forEach(
+              Array.from({ length: 8 }),
+              () => makeRequest({ rpc: PrimaryKeyTest, payload: PrimaryKeyTest.payloadSchema.make({ id: 789 }) })
+            )
+            const results = yield* Effect.all(requests.map((request) => storage.saveRequest(request)), {
+              concurrency: "unbounded"
+            })
+            const saved = requests.filter((_, i) => results[i]._tag === "Success")
+            expect(saved).toHaveLength(1)
+            for (const result of results) {
+              if (result._tag === "Duplicate") {
+                expect(result.originalId).toEqual(saved[0].envelope.requestId)
+              }
+            }
+            const messages = yield* storage.unprocessedMessages([ShardId.make("default", 1)])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([saved[0].envelope.requestId])
+            expect(yield* backend.storedMessageIds).toHaveLength(1)
+          }))
+      }
+
       it.effect("resetRequests with no IDs leaves existing claims untouched", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
@@ -156,7 +306,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("resetRequests releases only the selected request at a shared address", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const selected = yield* makeRequest()
           const unrelated = yield* makeRequest()
@@ -172,7 +322,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("resetRequests preserves chunk replies, exit replies, and completed state", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const streaming = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 123 }) })
           const completed = yield* makeRequest()
@@ -185,20 +335,19 @@ describe("SqlMessageStorage", () => {
           const replies = yield* storage.repliesFor([streaming, completed])
           expect(replies).toHaveLength(2)
           expect(yield* storage.unprocessedMessages(shards)).toHaveLength(0)
-          const sql = yield* SqlClient.SqlClient
-          const processed = yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`
+          const processed = yield* backend.processedStates
           yield* storage.resetRequests([streaming.envelope.requestId, completed.envelope.requestId])
           const messages = yield* storage.unprocessedMessages(shards)
           // Replies keep both requests out of the SQL read loop.
           expect(messages).toHaveLength(0)
           expect(yield* storage.repliesFor([streaming, completed])).toEqual(replies)
-          expect(yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`).toEqual(processed)
-          yield* truncate
+          expect(yield* backend.processedStates).toEqual(processed)
+          yield* backend.truncate
         }))
 
       it.effect("clearReplies requeues when the expected reply is current", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           const reply = yield* makeReply(request)
@@ -211,8 +360,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("clearReplies with a stale expected reply preserves a newer completion and processed state", () =>
         Effect.gen(function*() {
-          yield* truncate
-          const sql = yield* SqlClient.SqlClient
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 123 }) })
           const oldReply = yield* makeChunkReply(request)
@@ -220,21 +368,15 @@ describe("SqlMessageStorage", () => {
           yield* storage.saveRequest(request)
           yield* storage.saveReply(oldReply)
           yield* storage.saveReply(completed)
-          const before = yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${
-            String(request.envelope.requestId)
-          }`.pipe(Effect.provideService(SqlClient.SafeIntegers, true))
+          const before = yield* backend.messageState(String(request.envelope.requestId))
           yield* storage.clearReplies(request.envelope.requestId, { expectedReplyId: oldReply.reply.id })
           expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([
             oldReply.reply.id,
             completed.reply.id
           ])
-          expect(
-            yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${
-              String(request.envelope.requestId)
-            }`.pipe(Effect.provideService(SqlClient.SafeIntegers, true))
-          ).toEqual(before)
+          expect(yield* backend.messageState(String(request.envelope.requestId))).toEqual(before)
           expect(yield* storage.unprocessedMessages([request.envelope.address.shardId])).toHaveLength(0)
-          yield* truncate
+          yield* backend.truncate
         }))
 
       it.effect("saveRequest", () =>
@@ -318,7 +460,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("detects duplicates", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           yield* storage.saveRequest(
@@ -338,7 +480,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("hashes primary keys longer than the message_id column", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const longId = "long-key-".repeat(50)
@@ -364,17 +506,15 @@ describe("SqlMessageStorage", () => {
           })
           expect(requestId).toEqual(Option.some(request.envelope.requestId))
 
-          const sql = yield* SqlClient.SqlClient
-          const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
-          expect(rows).toHaveLength(1)
-          expect(rows[0].message_id).toMatch(/^[0-9a-f]{64}$/)
+          const messageIds = yield* backend.storedMessageIds
+          expect(messageIds).toHaveLength(1)
+          expect(messageIds[0]).toMatch(/^[0-9a-f]{64}$/)
         }))
 
       it.effect("keeps primary keys within the column width as plaintext", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
-          const sql = yield* SqlClient.SqlClient
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest({
             rpc: PrimaryKeyTest,
@@ -385,9 +525,9 @@ describe("SqlMessageStorage", () => {
           // rows written by previous versions store the plaintext composed
           // key, so short keys must stay byte-identical to keep deduplicating
           const plaintext = Envelope.primaryKey(request.envelope)!
-          const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
-          expect(rows).toHaveLength(1)
-          expect(rows[0].message_id).toEqual(plaintext)
+          const messageIds = yield* backend.storedMessageIds
+          expect(messageIds).toHaveLength(1)
+          expect(messageIds[0]).toEqual(plaintext)
 
           const result = yield* storage.saveRequest(
             yield* makeRequest({
@@ -412,7 +552,7 @@ describe("SqlMessageStorage", () => {
         // than the 255-character limit of the width-enforcing dialects
         it.effect("detects duplicates for legacy long-key plaintext rows", () =>
           Effect.gen(function*() {
-            yield* truncate
+            yield* backend.truncate
 
             const sql = yield* SqlClient.SqlClient
             const storage = yield* MessageStorage.MessageStorage
@@ -450,7 +590,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
@@ -466,7 +606,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages honors the limit and claims only returned rows", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardId = ShardId.make("default", 1)
@@ -485,7 +625,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages filters by address", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardId = ShardId.make("default", 1)
@@ -510,7 +650,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages filters addresses by shard", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardOne = ShardId.make("default", 1)
@@ -533,12 +673,12 @@ describe("SqlMessageStorage", () => {
 
       it.effect("encoded unprocessedMessages fails closed for empty addresses", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
-          const encoded = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+          const encoded = yield* backend.makeEncoded
           const shardId = request.envelope.address.shardId.toString()
           const messages = yield* encoded.unprocessedMessages([shardId], Date.now(), { addresses: [] })
           expect(messages).toHaveLength(0)
@@ -549,12 +689,12 @@ describe("SqlMessageStorage", () => {
 
       it.effect("encoded resetAddresses fails closed for an empty address list", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
-          const encoded = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+          const encoded = yield* backend.makeEncoded
           const shardId = request.envelope.address.shardId.toString()
           const claimed = yield* encoded.unprocessedMessages([shardId], Date.now())
           expect(claimed).toHaveLength(1)
@@ -566,7 +706,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("resetAddresses releases claims in one batch", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardId = ShardId.make("default", 1)
@@ -588,7 +728,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages excludes complete requests", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
@@ -600,7 +740,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("repliesFor", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
@@ -633,7 +773,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessagesById", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest({
@@ -649,7 +789,7 @@ describe("SqlMessageStorage", () => {
           const ack = yield* makeAckChunk(request, chunk)
           yield* storage.saveEnvelope(ack)
 
-          const encoded = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+          const encoded = yield* backend.makeEncoded
           const acknowledgements = yield* encoded.unprocessedMessagesById([ack.envelope.id], 0)
           expect(acknowledgements).toHaveLength(1)
           assert(acknowledgements[0].envelope._tag === "AckChunk")
