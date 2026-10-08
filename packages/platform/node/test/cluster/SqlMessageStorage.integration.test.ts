@@ -614,6 +614,66 @@ describe("SqlMessageStorage", () => {
             yield* assertRequeued
           }))
 
+        it.effect("a request saved again while its exit is archived stays complete", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+
+            // A retried send saves the request again right after the pass
+            // removed the exit from Keeper and before it checks Keeper.
+            const result = yield* archiveNow({
+              afterKeeperDelete: () => Effect.orDie(Effect.asVoid(storage.saveRequest(request)))
+            })
+            expect(result).toEqual({ archived: 1, compensated: 0 })
+            expect(yield* count("cluster_pending")).toEqual(0)
+            expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([reply.reply.id])
+
+            // And again after archiving.
+            expect((yield* storage.saveRequest(request))._tag).toEqual("Success")
+            expect(yield* count("cluster_pending")).toEqual(0)
+            expect(yield* storage.unprocessedMessages([request.envelope.address.shardId])).toHaveLength(0)
+            expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([reply.reply.id])
+          }))
+
+        it.effect("a key archived for a request that was then removed is taken over", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const removed = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 888 })
+            })
+            yield* storage.saveRequest(removed)
+            yield* storage.saveReply(yield* makeReply(removed))
+            yield* archiveNow()
+            yield* storage.clearAddress(removed.envelope.address)
+            // A pass racing the clear archives the key again after the clear.
+            yield* sql`
+              INSERT INTO cluster_message_ids_archive (message_id, id)
+              SELECT ${Envelope.primaryKey(removed.envelope)!}, ${sql.literal(String(removed.envelope.requestId))}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+
+            const next = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 888 })
+            })
+            expect((yield* storage.saveRequest(next))._tag).toEqual("Success")
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: next.envelope.address,
+                tag: next.envelope.tag,
+                id: "888"
+              })
+            ).toEqual(Option.some(next.envelope.requestId))
+            const messages = yield* storage.unprocessedMessages([next.envelope.address.shardId])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([next.envelope.requestId])
+          }))
+
         it.effect("concurrent readers never claim the same message", () =>
           Effect.gen(function*() {
             yield* backend.truncate
