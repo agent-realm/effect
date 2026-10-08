@@ -52,6 +52,10 @@ const int64 = (value: string) => KeeperMap.int64List([value]).slice(1, -1)
 export interface ArchiveHooks {
   /** Runs after the pass has read the exits it is about to archive. */
   readonly afterRead?: (exits: ReadonlyArray<readonly [requestId: string, replyId: string]>) => Effect.Effect<void>
+  /** Runs after the pass has removed those exits from Keeper. */
+  readonly afterKeeperDelete?: (
+    exits: ReadonlyArray<readonly [requestId: string, replyId: string]>
+  ) => Effect.Effect<void>
 }
 
 /** @internal */
@@ -129,6 +133,9 @@ export const archivePass = (options: {
           AND completed_at < ${cutoff}
         `)), { discard: true })
     }
+    if (options.hooks?.afterKeeperDelete) {
+      yield* options.hooks.afterKeeperDelete(exits)
+    }
     // 3. Keep an archive row only where Keeper now holds nothing about the
     //    request: no exit and no pending request row.
     const requestIds = exits.map(([requestId]) => requestId)
@@ -180,13 +187,21 @@ export const archivePass = (options: {
           ALTER TABLE ${sql(tables.messageIds)}
           DELETE WHERE has(${keyPairs}, (message_id, id))
         `))
+        // Compensate where Keeper still holds the key, or where the owner's
+        // message is gone (a `clearAddress` ran in between).
         const still = new Set(
           (yield* sql`
             SELECT message_id FROM ${sql(tables.messageIds)}
             WHERE message_id IN ${strings(chunk.map(([key]) => key))}
           `.values).map((row) => String(row[0]))
         )
-        const back = chunk.filter(([key]) => still.has(key))
+        const present = new Set(
+          (yield* sql`
+            SELECT id FROM ${sql(tables.messages)}
+            WHERE request_id IN ${ids(chunk.map(([, owner]) => owner))} AND id = request_id
+          `.values).map((row) => String(row[0]))
+        )
+        const back = chunk.filter(([key, owner]) => still.has(key) || !present.has(owner))
         if (back.length > 0) {
           keysCompensated += back.length
           yield* command(sql`

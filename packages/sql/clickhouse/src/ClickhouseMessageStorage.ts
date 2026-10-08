@@ -68,14 +68,7 @@ import * as NodeCrypto from "node:crypto"
 import * as ClickhouseClient from "./ClickhouseClient.ts"
 import * as ClickhouseMigrator from "./ClickhouseMigrator.ts"
 import * as KeeperMap from "./internal/keeperMap.ts"
-import {
-  archivePass,
-  chunksOf,
-  forChunks,
-  idChunk,
-  keyChunk,
-  tableNames
-} from "./internal/messageArchive.ts"
+import { archivePass, chunksOf, forChunks, idChunk, keyChunk, tableNames } from "./internal/messageArchive.ts"
 
 const withTracerDisabled = Effect.withTracerEnabled(false)
 
@@ -250,10 +243,17 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       if (owner === requestId || (yield* hasMessage(owner))) {
         return owner
       }
+      // Take the key over: a compare-and-set on the owner where Keeper holds
+      // it, or a strict insert where only the archive still names it, after
+      // which Keeper decides.
       yield* succeeded(strict(sql`
         ALTER TABLE ${messageIdsTable}
         UPDATE id = ${int64(requestId)}
         WHERE message_id = ${messageId} AND id = ${int64(owner)}
+      `))
+      yield* succeeded(strict(sql`
+        INSERT INTO ${messageIdsTable} (message_id, id)
+        SELECT ${messageId}, ${int64(requestId)}
       `))
       owner = yield* requestIdForMessageId(messageId)
       if (owner === requestId) {
@@ -271,9 +271,11 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     if (requestIds.length === 0) {
       return exits
     }
-    for (const [requestId, replyId] of yield* sql`
+    for (
+      const [requestId, replyId] of yield* sql`
       SELECT request_id, reply_id FROM ${exitsTable} WHERE request_id IN ${ids(requestIds)}
-    `.values) {
+    `.values
+    ) {
       exits.set(String(requestId), { replyId: String(replyId), archived: false })
     }
     const rest = requestIds.filter((requestId) => !exits.has(requestId))
@@ -287,17 +289,31 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     if (unknown.length === 0) {
       return exits
     }
-    for (const [requestId, replyId] of yield* sql`
+    for (
+      const [requestId, replyId] of yield* sql`
       SELECT request_id, max(reply_id) FROM ${exitsArchiveTable}
       WHERE request_id IN ${ids(unknown)}
       GROUP BY request_id
-    `.values) {
+    `.values
+    ) {
       exits.set(String(requestId), { replyId: String(replyId), archived: true })
     }
     return exits
   })
   const exitWithSource = (requestId: string) => Effect.map(exitsFor([requestId]), (exits) => exits.get(requestId))
   const exitFor = (requestId: string) => Effect.map(exitWithSource(requestId), (exit) => exit?.replyId)
+
+  // A request saved again under its id (a retried send) is not enqueued again
+  // once it is pending or complete: a second pending row for a completed
+  // request would make it look unfinished once its exit is archived. A save
+  // that stopped before enqueueing is completed by the retry.
+  const alreadySaved = Effect.fnUntraced(function*(requestId: string) {
+    if (!(yield* hasMessage(requestId))) {
+      return false
+    }
+    const live = yield* sql`SELECT id FROM ${pendingTable} WHERE id IN ${ids([requestId])}`.values
+    return live.length > 0 || (yield* exitFor(requestId)) !== undefined
+  })
 
   // The latest reply of a request: its exit once completed, otherwise the
   // latest chunk recorded on its pending row.
@@ -571,10 +587,10 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
             : sql.literal("0")
         }
           OR (kind IS NULL ${
-        unacknowledgedOnly
-          ? sql`AND id NOT IN (SELECT reply_id FROM ${replyAcksTable} WHERE request_id IN ${ids(chunk)})`
-          : emptyFragment
-      })
+          unacknowledgedOnly
+            ? sql`AND id NOT IN (SELECT reply_id FROM ${replyAcksTable} WHERE request_id IN ${ids(chunk)})`
+            : emptyFragment
+        })
         )
         ORDER BY rowid ASC
         LIMIT 1 BY id
@@ -588,6 +604,9 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       Effect.gen(function*() {
         if (primaryKey === null) {
           const row = envelopeToRow(envelope, null, deliverAt)
+          if (envelope._tag === "Request" && (yield* alreadySaved(row.id))) {
+            return SaveResultEncoded.Success()
+          }
           yield* insertMessage(row)
           yield* enqueue(row)
           if (envelope._tag === "AckChunk") {
