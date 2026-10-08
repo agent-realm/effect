@@ -16,3 +16,9 @@ export * as ClickhouseClient from "./ClickhouseClient.ts"
  * @since 4.0.0
  */
 export * as ClickhouseMigrator from "./ClickhouseMigrator.ts"
+
+/**
+ * @stability unstable
+ * @since 4.0.0
+ */
+export * as ClickhouseRunnerStorage from "./ClickhouseRunnerStorage.ts"
