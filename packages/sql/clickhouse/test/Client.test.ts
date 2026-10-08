@@ -168,7 +168,7 @@ describe("ClickhouseClient", { concurrent: false }, () => {
       const queries: Array<string> = []
       queryImpl = (options) => {
         queries.push(String(options.query))
-        return Promise.resolve({ json: () => Promise.resolve({ data: [] }) })
+        return Promise.resolve({ text: () => Promise.resolve(`{"data":[]}`) })
       }
       const client = yield* ClickhouseClient.make({ url: "http://localhost:8123" })
       const applied = yield* ClickhouseMigrator.run({
@@ -217,6 +217,58 @@ describe("ClickhouseClient", { concurrent: false }, () => {
       Effect.ensuring(Effect.sync(() => {
         queryImpl = undefined
       })),
+      Effect.provide(Reactivity.layer)
+    ))
+
+  it.effect("returns no rows for statements that answer with an empty body", () =>
+    Effect.gen(function*() {
+      connectImmediately = true
+      queryImpl = () =>
+        Promise.resolve({
+          json: () => Promise.reject(new SyntaxError("Unexpected end of JSON input")),
+          text: () => Promise.resolve("")
+        })
+      const client = yield* ClickhouseClient.make({ url: "http://localhost:8123" })
+
+      const rows = yield* client.unsafe("CREATE TABLE people (name String) ENGINE = Memory")
+
+      assert.deepStrictEqual(rows, [])
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => {
+        queryImpl = undefined
+      })),
+      Effect.scoped,
+      Effect.provide(Reactivity.layer)
+    ))
+
+  it.effect("parses query results with the configured JSON parser", () =>
+    Effect.gen(function*() {
+      connectImmediately = true
+      queryImpl = () =>
+        Promise.resolve({
+          json: () => Promise.reject(new Error("json() is not used")),
+          text: () => Promise.resolve(`{"data":[{"name":"Alice"}]}`)
+        })
+      const parsed: Array<string> = []
+      const client = yield* ClickhouseClient.make({
+        url: "http://localhost:8123",
+        json: {
+          parse: (input) => {
+            parsed.push(input)
+            return JSON.parse(input)
+          }
+        }
+      })
+
+      const rows = yield* client.unsafe("SELECT name FROM people")
+
+      assert.deepStrictEqual(rows, [{ name: "Alice" }])
+      assert.deepStrictEqual(parsed, [`{"data":[{"name":"Alice"}]}`])
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => {
+        queryImpl = undefined
+      })),
+      Effect.scoped,
       Effect.provide(Reactivity.layer)
     ))
 })
