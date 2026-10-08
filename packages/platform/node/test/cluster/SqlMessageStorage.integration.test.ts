@@ -256,6 +256,133 @@ describe("SqlMessageStorage", () => {
             assert.include(String(Cause.squash(exit.cause)), "use ClickhouseMessageStorage")
           }))
 
+        it.effect("concurrent acknowledgements leave the newest one pending", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 1 }) })
+            yield* storage.saveRequest(request)
+            const chunk = yield* makeChunkReply(request)
+            yield* storage.saveReply(chunk)
+            const acks = yield* Effect.forEach(Array.from({ length: 4 }), () => makeAckChunk(request, chunk))
+            yield* Effect.all(acks.map((ack) => storage.saveEnvelope(ack)), { concurrency: "unbounded" })
+            const pending = yield* sql<{ id: string }>`
+              SELECT toString(p.id) AS id FROM cluster_pending p
+              INNER JOIN cluster_messages m ON m.id = p.id
+              WHERE p.kind = 1 ORDER BY m.rowid DESC
+            `
+            const newest = yield* sql<{ id: string }>`
+              SELECT toString(id) AS id FROM cluster_messages WHERE kind = 1 ORDER BY rowid DESC LIMIT 1
+            `
+            expect(pending.map((row) => row.id)).toEqual([newest[0].id])
+          }))
+
+        it.effect("a clearReplies stopped before removing the exit keeps the request hidden", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+            // The state a stop leaves between requeueing and removing the exit.
+            const id = sql.literal(String(request.envelope.requestId))
+            yield* sql`
+              INSERT INTO cluster_pending (id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, last_reply_id, last_read, claim)
+              SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, NULL, NULL, ''
+              FROM cluster_messages WHERE id = ${id}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+            const shard = [request.envelope.address.shardId]
+            expect(yield* storage.unprocessedMessages(shard)).toHaveLength(0)
+            expect(yield* sql`SELECT id FROM cluster_pending WHERE id = ${id}`).toHaveLength(1)
+
+            // Running the clear again completes it.
+            yield* storage.clearReplies(request.envelope.requestId, { expectedReplyId: reply.reply.id })
+            expect(yield* storage.repliesFor([request])).toHaveLength(0)
+            const messages = yield* storage.unprocessedMessages(shard)
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([request.envelope.requestId])
+          }))
+
+        it.effect("a key left behind by clearAddress does not swallow the next save", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const removed = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 321 })
+            })
+            yield* storage.saveRequest(removed)
+            yield* storage.clearAddress(removed.envelope.address)
+            // A save that recorded its key after the clear removed its message.
+            const key = Envelope.primaryKey(removed.envelope)!
+            yield* sql`
+              INSERT INTO cluster_message_ids (message_id, id)
+              SELECT ${key}, ${sql.literal(String(removed.envelope.requestId))}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: removed.envelope.address,
+                tag: removed.envelope.tag,
+                id: "321"
+              })
+            ).toEqual(Option.none())
+
+            const next = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 321 })
+            })
+            expect((yield* storage.saveRequest(next))._tag).toEqual("Success")
+            const messages = yield* storage.unprocessedMessages([next.envelope.address.shardId])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([next.envelope.requestId])
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: next.envelope.address,
+                tag: next.envelope.tag,
+                id: "321"
+              })
+            ).toEqual(Option.some(next.envelope.requestId))
+          }))
+
+        it.effect("reads mailboxes longer than one statement can list", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const encoded = yield* backend.makeEncoded
+            const command = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.provideService(effect, ClickhouseClient.ClientMethod, "command")
+            // Ids as long as real Snowflakes, so the id lists are realistic.
+            const count = 2500
+            yield* command(sql`
+              INSERT INTO cluster_messages (id, shard_id, entity_type, entity_id, kind, tag, payload, headers, request_id)
+              SELECT -7280009832000000000 + number, 'default:1', 'test', toString(number), 0, 'GetUser', '{"id":1}', '{}',
+                -7280009832000000000 + number
+              FROM numbers(${sql.literal(String(count))})
+            `)
+            yield* command(sql`
+              INSERT INTO cluster_pending (id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, last_reply_id, last_read, claim)
+              SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, NULL, NULL, ''
+              FROM cluster_messages
+            `)
+            const shard = ShardId.make("default", 1)
+            const addresses = Array.from({ length: 3000 }, (_, i) =>
+              EntityAddress.make({
+                shardId: shard,
+                entityType: EntityType.make("test"),
+                entityId: EntityId.make(String(i))
+              }))
+            const batch = yield* encoded.unprocessedMessages([shard.toString()], Date.now(), { limit: 1024, addresses })
+            expect(batch).toHaveLength(1024)
+            const rest = yield* encoded.unprocessedMessages([shard.toString()], Date.now())
+            expect(rest).toHaveLength(count - 1024)
+            const claimed = [...batch, ...rest].map((message) => message.envelope.address.entityId)
+            expect(new Set(claimed).size).toEqual(count)
+            yield* encoded.resetAddresses(addresses)
+            expect(yield* encoded.unprocessedMessages([shard.toString()], Date.now())).toHaveLength(count)
+          }))
+
         it.effect("concurrent readers never claim the same message", () =>
           Effect.gen(function*() {
             yield* backend.truncate
