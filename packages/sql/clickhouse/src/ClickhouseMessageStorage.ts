@@ -25,9 +25,17 @@
  * does not group writes.
  *
  * The server needs ClickHouse Keeper (embedded or external) and a
- * `keeper_map_path_prefix` in its configuration. `<prefix>_message_ids` and
- * `<prefix>_exits` grow with the number of requests until `clearAddress`
- * removes them.
+ * `keeper_map_path_prefix` in its configuration.
+ *
+ * Keeper holds requests in flight and those completed recently. The layers
+ * run a background pass every `archiveInterval` (default 5 minutes) that
+ * moves the exits and primary keys of requests completed more than
+ * `retention` ago (default 1 hour) to the MergeTree tables
+ * `<prefix>_exits_archive` and `<prefix>_message_ids_archive`. Keeper stays
+ * authoritative: the archive is read only for requests Keeper holds nothing
+ * about, so deduplication, `requestIdForPrimaryKey` and resuming a suspended
+ * workflow keep working after archiving. `retention` must exceed the
+ * 10-minute claim lease. `make` and `makeEncoded` do not start the pass.
  *
  * `layer`, `layerWith`, `make`, and `makeEncoded` run the migrations before
  * building the storage. To run migrations with a different connection, use
@@ -46,6 +54,7 @@ import * as ShardId from "effect/cluster/ShardId"
 import type { ShardingConfig } from "effect/cluster/ShardingConfig"
 import * as Snowflake from "effect/cluster/Snowflake"
 import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Hex from "effect/encoding/Hex"
 import * as Layer from "effect/Layer"
@@ -59,6 +68,14 @@ import * as NodeCrypto from "node:crypto"
 import * as ClickhouseClient from "./ClickhouseClient.ts"
 import * as ClickhouseMigrator from "./ClickhouseMigrator.ts"
 import * as KeeperMap from "./internal/keeperMap.ts"
+import {
+  archivePass,
+  chunksOf,
+  forChunks,
+  idChunk,
+  keyChunk,
+  tableNames
+} from "./internal/messageArchive.ts"
 
 const withTracerDisabled = Effect.withTracerEnabled(false)
 
@@ -95,6 +112,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
   const messageIdsTable = sql(tables.messageIds)
   const pendingTable = sql(tables.pending)
   const exitsTable = sql(tables.exits)
+  const exitsArchiveTable = sql(tables.exitsArchive)
+  const messageIdsArchiveTable = sql(tables.messageIdsArchive)
 
   const command = <A>(statement: Effect.Effect<A, SqlError>) => client.asCommand(statement)
   const strict = <A>(statement: Effect.Effect<A, SqlError>) =>
@@ -174,12 +193,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       LIMIT 1 BY id
     `)
   // ClickHouse rejects statements longer than `max_query_size` (256 KiB by
-  // default), so lists of ids and keys are sent in chunks.
-  const forChunks = <A, B, E>(
-    items: ReadonlyArray<A>,
-    size: number,
-    f: (chunk: ReadonlyArray<A>) => Effect.Effect<ReadonlyArray<B>, E>
-  ): Effect.Effect<Array<B>, E> => Effect.map(Effect.forEach(chunksOf(items, size), f), (results) => results.flat())
+  // default), so lists of ids and keys are sent in chunks (`forChunks`).
 
   const dequeue = (messageIds: ReadonlyArray<string>) =>
     forChunks(
@@ -191,10 +205,18 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         )
     )
 
-  const requestIdForMessageId = (messageId: string) =>
-    sql`SELECT id FROM ${messageIdsTable} WHERE message_id = ${messageId}`.values.pipe(
-      Effect.map((rows) => rows.length > 0 ? String(rows[0][0]) : undefined)
-    )
+  // Keeper decides; the archive answers only for keys Keeper does not hold.
+  // An archived key is never re-pointed, and the newest owner wins.
+  const requestIdForMessageId = Effect.fnUntraced(function*(messageId: string) {
+    const live = yield* sql`SELECT id FROM ${messageIdsTable} WHERE message_id = ${messageId}`.values
+    if (live.length > 0) {
+      return String(live[0][0])
+    }
+    const archived = yield* sql`
+      SELECT max(id) FROM ${messageIdsArchiveTable} WHERE message_id = ${messageId} HAVING count() > 0
+    `.values
+    return archived.length > 0 ? String(archived[0][0]) : undefined
+  })
   const hasMessage = (requestId: string) =>
     sql`
       SELECT count() FROM ${messagesTable}
@@ -241,10 +263,41 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     return owner ?? requestId
   })
 
-  const exitFor = (requestId: string) =>
-    sql`SELECT reply_id FROM ${exitsTable} WHERE request_id IN ${ids([requestId])}`.values.pipe(
-      Effect.map((rows) => rows.length > 0 ? String(rows[0][0]) : undefined)
+  // Exits of completed requests. Keeper decides: the archive answers only for
+  // requests Keeper holds nothing about, neither an exit nor a pending request
+  // row, so a stale archive row can never make a requeued request complete.
+  const exitsFor = Effect.fnUntraced(function*(requestIds: ReadonlyArray<string>) {
+    const exits = new Map<string, { readonly replyId: string; readonly archived: boolean }>()
+    if (requestIds.length === 0) {
+      return exits
+    }
+    for (const [requestId, replyId] of yield* sql`
+      SELECT request_id, reply_id FROM ${exitsTable} WHERE request_id IN ${ids(requestIds)}
+    `.values) {
+      exits.set(String(requestId), { replyId: String(replyId), archived: false })
+    }
+    const rest = requestIds.filter((requestId) => !exits.has(requestId))
+    if (rest.length === 0) {
+      return exits
+    }
+    const live = new Set(
+      (yield* sql`SELECT id FROM ${pendingTable} WHERE id IN ${ids(rest)}`.values).map((row) => String(row[0]))
     )
+    const unknown = rest.filter((requestId) => !live.has(requestId))
+    if (unknown.length === 0) {
+      return exits
+    }
+    for (const [requestId, replyId] of yield* sql`
+      SELECT request_id, max(reply_id) FROM ${exitsArchiveTable}
+      WHERE request_id IN ${ids(unknown)}
+      GROUP BY request_id
+    `.values) {
+      exits.set(String(requestId), { replyId: String(replyId), archived: true })
+    }
+    return exits
+  })
+  const exitWithSource = (requestId: string) => Effect.map(exitsFor([requestId]), (exits) => exits.get(requestId))
+  const exitFor = (requestId: string) => Effect.map(exitWithSource(requestId), (exit) => exit?.replyId)
 
   // The latest reply of a request: its exit once completed, otherwise the
   // latest chunk recorded on its pending row.
@@ -293,10 +346,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       return []
     }
     const requestIds = new Set(candidates.map((candidate) => candidate.request_id))
-    const completed = new Set(
-      (yield* sql`SELECT request_id FROM ${exitsTable} WHERE request_id IN ${ids(requestIds)}`.values)
-        .map((row) => String(row[0]))
-    )
+    const completed = new Set((yield* exitsFor(Array.from(requestIds))).keys())
     const waiting = new Set(
       (yield* sql`
         SELECT DISTINCT request_id FROM ${repliesTable}
@@ -315,6 +365,19 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         WHERE message_id IN ${strings(chunk.map((candidate) => candidate.message_id!))}
       `.values)
     for (const [messageId, id] of ownerRows) {
+      owners.set(String(messageId), String(id))
+    }
+    const archivedOwnerRows = yield* forChunks(
+      keyed.filter((candidate) => !owners.has(candidate.message_id!)),
+      keyChunk,
+      (chunk) =>
+        sql`
+          SELECT message_id, max(id) FROM ${messageIdsArchiveTable}
+          WHERE message_id IN ${strings(chunk.map((candidate) => candidate.message_id!))}
+          GROUP BY message_id
+        `.values
+    )
+    for (const [messageId, id] of archivedOwnerRows) {
       owners.set(String(messageId), String(id))
     }
     const losers: Array<string> = []
@@ -496,12 +559,17 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
 
   const repliesWhere = (requestIds: ReadonlyArray<string>, unacknowledgedOnly: boolean) =>
     forChunks(requestIds, idChunk, (chunk) =>
-      sql<ReplyRow & { readonly rowid: string }>`
+      Effect.flatMap(exitsFor(chunk), (exits) => {
+        const exitIds = Array.from(exits.values(), (exit) => exit.replyId)
+        return sql<ReplyRow & { readonly rowid: string }>`
         SELECT id, kind, request_id, payload, sequence, rowid FROM ${repliesTable}
         WHERE request_id IN ${ids(chunk)}
         AND (
-          (kind = ${sql.literal(String(replyKind.WithExit))}
-            AND id IN (SELECT reply_id FROM ${exitsTable} WHERE request_id IN ${ids(chunk)}))
+          ${
+          exitIds.length > 0
+            ? sql`(kind = ${sql.literal(String(replyKind.WithExit))} AND id IN ${ids(exitIds)})`
+            : sql.literal("0")
+        }
           OR (kind IS NULL ${
         unacknowledgedOnly
           ? sql`AND id NOT IN (SELECT reply_id FROM ${replyAcksTable} WHERE request_id IN ${ids(chunk)})`
@@ -510,7 +578,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         )
         ORDER BY rowid ASC
         LIMIT 1 BY id
-      `).pipe(
+      `
+      })).pipe(
         Effect.map((rows) => rows.sort(byRowid).map(replyFromRow))
       )
 
@@ -618,6 +687,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
           `)
           yield* requeue(id, false)
           yield* retryOnConflict(strict(sql`ALTER TABLE ${exitsTable} DELETE WHERE request_id IN ${ids([id])}`))
+          yield* command(sql`DELETE FROM ${exitsArchiveTable} WHERE request_id = ${int64(id)}`)
           yield* command(sql`
             DELETE FROM ${repliesTable}
             WHERE request_id = ${int64(id)} AND kind = ${sql.literal(String(replyKind.WithExit))}
@@ -626,12 +696,30 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         }
 
         // Compare with the latest reply at the storage boundary.
-        const exit = yield* exitFor(id)
+        const exit = yield* exitWithSource(id)
         if (exit !== undefined) {
-          if (exit !== expected) {
+          if (exit.replyId !== expected) {
             return
           }
+          if (exit.archived) {
+            // Bring the archived exit back to Keeper first, so the clear below
+            // has its compare-and-set anchor.
+            yield* succeeded(strict(sql`
+              INSERT INTO ${exitsTable} (request_id, reply_id)
+              SELECT ${int64(id)}, ${int64(expected)}
+            `))
+            if ((yield* exitFor(id)) !== expected) {
+              return
+            }
+          }
           yield* requeue(id, true)
+          if (exit.archived) {
+            // The pending request now makes Keeper decide, so the archive row
+            // can go without leaving a moment where nothing holds the request.
+            yield* command(sql`
+              DELETE FROM ${exitsArchiveTable} WHERE request_id = ${int64(id)} AND reply_id = ${int64(expected)}
+            `)
+          }
           yield* succeeded(strict(sql`
             ALTER TABLE ${exitsTable}
             DELETE WHERE request_id IN ${ids([id])} AND reply_id = ${int64(expected)}
@@ -740,6 +828,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         yield* forChunks(requestIds, idChunk, (chunk) =>
           Effect.gen(function*() {
             yield* retryOnConflict(strict(sql`ALTER TABLE ${exitsTable} DELETE WHERE request_id IN ${ids(chunk)}`))
+            yield* command(sql`DELETE FROM ${exitsArchiveTable} WHERE request_id IN ${ids(chunk)}`)
             yield* command(sql`DELETE FROM ${repliesTable} WHERE request_id IN ${ids(chunk)}`)
             yield* command(sql`DELETE FROM ${replyAcksTable} WHERE request_id IN ${ids(chunk)}`)
             return []
@@ -749,7 +838,14 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
             ALTER TABLE ${messageIdsTable}
             DELETE WHERE message_id IN ${strings(chunk.map(([key]) => key))}
             AND id IN ${ids(chunk.map(([, requestId]) => requestId))}
-          `)).pipe(Effect.as([])))
+          `)).pipe(
+            Effect.andThen(command(sql`
+              DELETE FROM ${messageIdsArchiveTable}
+              WHERE message_id IN ${strings(chunk.map(([key]) => key))}
+              AND id IN ${ids(chunk.map(([, requestId]) => requestId))}
+            `)),
+            Effect.as([])
+          ))
         yield* forChunks(messageIds, idChunk, (chunk) =>
           command(sql`DELETE FROM ${messagesTable} WHERE id IN ${ids(chunk)}`).pipe(Effect.as([])))
       }).pipe(
@@ -873,7 +969,25 @@ export const migrations = (options?: {
         enqueued_at DateTime64(3) DEFAULT now64(3)`,
         "id"
       )
-      yield* keeperMap(tables.exits, `request_id Int64, reply_id Int64`, "request_id")
+      yield* keeperMap(
+        tables.exits,
+        `request_id Int64, reply_id Int64, completed_at DateTime64(3) DEFAULT now64(3)`,
+        "request_id"
+      )
+      // Archives of entries moved out of Keeper. The newest exit (or owner)
+      // of a request (or key) wins; its Snowflake id is the version, with the
+      // sign bit flipped so signed ids order as unsigned.
+      const archive = (table: string, columns: string, orderBy: string, versionOf: string) =>
+        KeeperMap.asCommand(sql`
+          CREATE TABLE IF NOT EXISTS ${sql(table)} (
+            ${sql.literal(columns)},
+            version UInt64 MATERIALIZED bitXor(reinterpretAsUInt64(${sql.literal(versionOf)}), 9223372036854775808)
+          )
+          ENGINE = ReplacingMergeTree(version)
+          ORDER BY ${sql.literal(orderBy)}
+        `)
+      yield* archive(tables.exitsArchive, `request_id Int64, reply_id Int64`, "request_id", "reply_id")
+      yield* archive(tables.messageIdsArchive, `message_id String, id Int64`, "message_id", "id")
     })
   })
 }
@@ -917,19 +1031,62 @@ export const layerMigrations = (options: {
  * @category layers
  * @since 4.0.0
  */
-export const layerStorage = (options: {
-  readonly prefix?: string | undefined
-}): Layer.Layer<
+export const layerStorage = (options: StorageOptions): Layer.Layer<
   MessageStorage.MessageStorage,
   never,
   ClickhouseClient.ClickhouseClient | ShardingConfig | Crypto.Crypto
 > =>
   Layer.effect(
     MessageStorage.MessageStorage,
-    Effect.flatMap(makeEncodedStorage(options), MessageStorage.makeEncoded)
+    Effect.gen(function*() {
+      const storage = yield* makeEncodedStorage(options)
+      yield* startArchiving(options)
+      return yield* MessageStorage.makeEncoded(storage)
+    })
   ).pipe(
     Layer.provide(Snowflake.layerGenerator)
   )
+
+/**
+ * Options for the ClickHouse message storage layers.
+ *
+ * **Details**
+ *
+ * `retention` (default 1 hour) is how long a completed request keeps its
+ * exit and primary key in Keeper before the background pass moves them to
+ * the archive tables; it must exceed the 10-minute claim lease.
+ * `archiveInterval` (default 5 minutes) is the pause between passes.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.0
+ */
+export interface StorageOptions {
+  readonly prefix?: string | undefined
+  readonly retention?: Duration.Input | undefined
+  readonly archiveInterval?: Duration.Input | undefined
+}
+
+// Several runners may archive at once: archive inserts collapse, and Keeper
+// deletes are conditional.
+const startArchiving = (options: StorageOptions) =>
+  Effect.gen(function*() {
+    const client = yield* ClickhouseClient.ClickhouseClient
+    const retention = options.retention ?? Duration.hours(1)
+    const drain: Effect.Effect<void, SqlError> = Effect.suspend(() =>
+      Effect.flatMap(
+        archivePass({ client, prefix: options.prefix, retention }),
+        (result) => result.archived + result.compensated >= idChunk ? drain : Effect.void
+      )
+    )
+    yield* Effect.sleep(options.archiveInterval ?? Duration.minutes(5)).pipe(
+      Effect.andThen(drain.pipe(
+        Effect.catchCause((cause) => Effect.logWarning("ClickhouseMessageStorage: archive pass failed", cause))
+      )),
+      Effect.forever,
+      Effect.forkScoped
+    )
+  })
 
 /**
  * Provides ClickHouse-backed `MessageStorage` with a custom table prefix,
@@ -939,9 +1096,7 @@ export const layerStorage = (options: {
  * @category layers
  * @since 4.0.0
  */
-export const layerWith = (options: {
-  readonly prefix?: string | undefined
-}): Layer.Layer<
+export const layerWith = (options: StorageOptions): Layer.Layer<
   MessageStorage.MessageStorage,
   never,
   ClickhouseClient.ClickhouseClient | ShardingConfig | Crypto.Crypto
@@ -967,18 +1122,6 @@ export const layer: Layer.Layer<
 // -------------------------------------------------------------------------------------------------
 // internal
 // -------------------------------------------------------------------------------------------------
-
-const tableNames = (prefix: string | undefined) => {
-  const table = (name: string) => `${prefix ?? "cluster"}_${name}`
-  return {
-    messages: table("messages"),
-    replies: table("replies"),
-    replyAcks: table("reply_acks"),
-    messageIds: table("message_ids"),
-    pending: table("pending"),
-    exits: table("exits")
-  }
-}
 
 class ExitAlreadySaved extends Error {
   constructor(requestId: string) {
@@ -1204,19 +1347,6 @@ type PendingRow = {
   readonly entity_id: string
   readonly last_reply_id: string | null
   readonly stale: boolean
-}
-
-// Snowflake ids inline as about 20 characters, keys as up to 257, against a
-// 256 KiB statement limit.
-const idChunk = 1000
-const keyChunk = 200
-
-const chunksOf = <A>(items: ReadonlyArray<A>, size: number): Array<ReadonlyArray<A>> => {
-  const chunks: Array<ReadonlyArray<A>> = []
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size))
-  }
-  return chunks
 }
 
 const addressKey = (shardId: string, entityType: string, entityId: string) =>
