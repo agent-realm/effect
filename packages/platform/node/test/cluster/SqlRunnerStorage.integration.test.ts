@@ -1,4 +1,5 @@
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
+import { ClickhouseClient, ClickhouseRunnerStorage } from "@effect/sql-clickhouse"
 import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, expect, it } from "@effect/vitest"
@@ -17,6 +18,7 @@ import {
 } from "effect/cluster"
 import { Migrator, SqlClient, type SqlConnection, SqlError } from "effect/sql"
 import { TestClock } from "effect/testing"
+import { ClickhouseContainer } from "../fixtures/clickhouse-utils.ts"
 import { MysqlContainer } from "../fixtures/mysql2-utils.ts"
 import { PgContainer } from "../fixtures/pg-utils.ts"
 
@@ -113,6 +115,56 @@ describe("cluster SQL storage with a DML-only role", () => {
         )
       }).pipe(Effect.timeout("20 seconds"), TestClock.withLive), 30_000)
   })
+})
+
+// Behaviour every runner storage backend shares.
+const getRunners = Effect.gen(function*() {
+  const storage = yield* RunnerStorage.RunnerStorage
+
+  const runner = Runner.make({
+    address: runnerAddress1,
+    groups: ["default"],
+    weight: 1
+  })
+  const machineId = yield* storage.register(runner, true)
+  yield* storage.register(runner, true)
+  expect(machineId).toEqual(1)
+  expect(yield* storage.getRunners).toEqual([[runner, true]])
+
+  yield* storage.setRunnerHealth(runnerAddress1, false)
+  expect(yield* storage.getRunners).toEqual([[runner, false]])
+
+  yield* storage.unregister(runnerAddress1)
+  expect(yield* storage.getRunners).toEqual([])
+})
+
+const acquireShards = Effect.gen(function*() {
+  const storage = yield* RunnerStorage.RunnerStorage
+
+  let acquired = yield* storage.acquire(runnerAddress1, [
+    ShardId.make("default", 1),
+    ShardId.make("default", 2),
+    ShardId.make("default", 3)
+  ])
+  expect(acquired.map((_) => _.id)).toEqual([1, 2, 3])
+  acquired = yield* storage.acquire(runnerAddress1, [
+    ShardId.make("default", 1),
+    ShardId.make("default", 2),
+    ShardId.make("default", 3)
+  ])
+  expect(acquired.map((_) => _.id)).toEqual([1, 2, 3])
+  acquired = yield* storage.acquire(runnerAddress1, [ShardId.make("default", 4)])
+  expect(acquired.map((_) => _.id)).toEqual([4])
+
+  const refreshed = yield* storage.refresh(runnerAddress1, [
+    ShardId.make("default", 1),
+    ShardId.make("default", 2),
+    ShardId.make("default", 3)
+  ])
+  expect(refreshed.map((_) => _.id).sort((a, b) => a - b)).toEqual([1, 2, 3])
+
+  // smoke test release
+  yield* storage.release(runnerAddress1, ShardId.make("default", 2))
 })
 
 const StorageLayer = SqlRunnerStorage.layer
@@ -517,56 +569,9 @@ describe("SqlRunnerStorage", () => {
       concurrent: false,
       timeout: 60000
     })(label, (it) => {
-      it.effect("getRunners", () =>
-        Effect.gen(function*() {
-          const storage = yield* RunnerStorage.RunnerStorage
+      it.effect("getRunners", () => getRunners, { timeout: 30_000 })
 
-          const runner = Runner.make({
-            address: runnerAddress1,
-            groups: ["default"],
-            weight: 1
-          })
-          const machineId = yield* storage.register(runner, true)
-          yield* storage.register(runner, true)
-          expect(machineId).toEqual(1)
-          expect(yield* storage.getRunners).toEqual([[runner, true]])
-
-          yield* storage.setRunnerHealth(runnerAddress1, false)
-          expect(yield* storage.getRunners).toEqual([[runner, false]])
-
-          yield* storage.unregister(runnerAddress1)
-          expect(yield* storage.getRunners).toEqual([])
-        }), { timeout: 30_000 })
-
-      it.effect("acquireShards", () =>
-        Effect.gen(function*() {
-          const storage = yield* RunnerStorage.RunnerStorage
-
-          let acquired = yield* storage.acquire(runnerAddress1, [
-            ShardId.make("default", 1),
-            ShardId.make("default", 2),
-            ShardId.make("default", 3)
-          ])
-          expect(acquired.map((_) => _.id)).toEqual([1, 2, 3])
-          acquired = yield* storage.acquire(runnerAddress1, [
-            ShardId.make("default", 1),
-            ShardId.make("default", 2),
-            ShardId.make("default", 3)
-          ])
-          expect(acquired.map((_) => _.id)).toEqual([1, 2, 3])
-          acquired = yield* storage.acquire(runnerAddress1, [ShardId.make("default", 4)])
-          expect(acquired.map((_) => _.id)).toEqual([4])
-
-          const refreshed = yield* storage.refresh(runnerAddress1, [
-            ShardId.make("default", 1),
-            ShardId.make("default", 2),
-            ShardId.make("default", 3)
-          ])
-          expect(refreshed.map((_) => _.id).sort((a, b) => a - b)).toEqual([1, 2, 3])
-
-          // smoke test release
-          yield* storage.release(runnerAddress1, ShardId.make("default", 2))
-        }))
+      it.effect("acquireShards", () => acquireShards)
 
       if (label === "pg") {
         it.effect("runner migrations adopt existing tables without migration records", () =>
@@ -592,6 +597,144 @@ describe("SqlRunnerStorage", () => {
           }))
       }
     })
+  })
+})
+
+describe("ClickhouseRunnerStorage", () => {
+  // Every test uses its own table prefix, so they share one server.
+  it.layer(Layer.orDie(ClickhouseContainer.layerClient), {
+    concurrent: false,
+    timeout: 120_000
+  })("clickhouse", (it) => {
+    it.layer(ClickhouseRunnerStorage.layer.pipe(Layer.provide(ShardingConfig.layer())), {
+      concurrent: false
+    })("shared behaviour", (it) => {
+      it.effect("getRunners", () => getRunners, { timeout: 30_000 })
+
+      it.effect("acquireShards", () => acquireShards)
+    })
+
+    it.effect("SqlRunnerStorage refuses a ClickHouse client", () =>
+      Effect.gen(function*() {
+        const exit = yield* SqlRunnerStorage.make({ prefix: "refused" }).pipe(
+          Effect.scoped,
+          Effect.provide(ShardingConfig.layer()),
+          Effect.exit
+        )
+        assert(Exit.isFailure(exit))
+        assert.include(String(Cause.squash(exit.cause)), "use ClickhouseRunnerStorage")
+      }))
+
+    it.effect("excludes other storages using the same prefix", () =>
+      Effect.gen(function*() {
+        const storageA = yield* ClickhouseRunnerStorage.make({ prefix: "exclusive" })
+        const storageB = yield* ClickhouseRunnerStorage.make({ prefix: "exclusive" })
+        const shard = ShardId.make("default", 1)
+
+        expect(yield* storageA.acquire(runnerAddress1, [shard])).toEqual([shard])
+        expect(yield* storageB.acquire(runnerAddress2, [shard])).toEqual([])
+
+        yield* storageA.release(runnerAddress1, shard)
+        expect(yield* storageB.acquire(runnerAddress2, [shard])).toEqual([shard])
+        expect(yield* storageA.refresh(runnerAddress1, [shard])).toEqual([])
+
+        yield* storageB.releaseAll(runnerAddress2)
+        expect(yield* storageA.acquire(runnerAddress1, [shard])).toEqual([shard])
+      }).pipe(Effect.scoped, Effect.provide(ShardingConfig.layer())), 60_000)
+
+    it.effect("isolates shard locks by prefix", () =>
+      Effect.gen(function*() {
+        const storageA = yield* ClickhouseRunnerStorage.make({ prefix: "isolated_a" })
+        const storageB = yield* ClickhouseRunnerStorage.make({ prefix: "isolated_b" })
+        const shard = ShardId.make("default", 1)
+
+        expect(yield* storageA.acquire(runnerAddress1, [shard])).toEqual([shard])
+        expect(yield* storageB.acquire(runnerAddress2, [shard])).toEqual([shard])
+      }).pipe(Effect.scoped, Effect.provide(ShardingConfig.layer())), 60_000)
+
+    it.effect("takes over a lock once it expires", () =>
+      Effect.gen(function*() {
+        const storageA = yield* ClickhouseRunnerStorage.make({ prefix: "expiry" })
+        const storageB = yield* ClickhouseRunnerStorage.make({ prefix: "expiry" })
+        const shards = [ShardId.make("default", 1), ShardId.make("default", 2)]
+
+        expect(yield* storageA.acquire(runnerAddress1, shards)).toEqual(shards)
+        expect(yield* storageB.acquire(runnerAddress2, shards)).toEqual([])
+
+        yield* Effect.sleep(lockOperationInterval * 4)
+        expect(yield* storageB.acquire(runnerAddress2, shards)).toEqual(shards)
+        expect(yield* storageA.refresh(runnerAddress1, shards)).toEqual([])
+        expect(yield* storageA.acquire(runnerAddress1, shards)).toEqual([])
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(ShardingConfig.layer({
+          shardLockExpiration: lockOperationInterval * 3,
+          shardLockRefreshInterval: lockOperationInterval
+        })),
+        TestClock.withLive
+      ), 60_000)
+
+    it.effect("hands each contended shard to exactly one runner", () =>
+      Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        const client = yield* ClickhouseClient.ClickhouseClient
+        const addresses = [runnerAddress1, runnerAddress2, RunnerAddress.make("localhost", 9012)]
+        const storages = yield* Effect.forEach(addresses, () => ClickhouseRunnerStorage.make({ prefix: "contended" }))
+        const shards = Array.from({ length: 30 }, (_, i) => ShardId.make("default", i + 1))
+
+        for (let round = 0; round < 10; round++) {
+          // The first round races to create the locks, the others to take
+          // them over once every one of them has expired.
+          if (round > 0) {
+            yield* client.asCommand(
+              sql`ALTER TABLE contended_locks UPDATE acquired_at = now64(3) - INTERVAL 1 HOUR WHERE 1`
+            )
+          }
+          const acquired = yield* Effect.all(
+            storages.map((storage, i) => storage.acquire(addresses[i], shards)),
+            { concurrency: "unbounded" }
+          )
+
+          const owners = new Map<string, string>()
+          acquired.forEach((held, i) => {
+            for (const shard of held) {
+              expect(owners.get(shard.toString()), `round ${round}: ${shard} held twice`).toBeUndefined()
+              owners.set(shard.toString(), `${addresses[i].host}:${addresses[i].port}`)
+            }
+          })
+          const rows = yield* sql<{ shard_id: string; address: string }>`
+            SELECT shard_id, address FROM contended_locks
+          `
+          expect(rows).toHaveLength(shards.length)
+          for (const row of rows) {
+            expect(owners.get(row.shard_id), `round ${round}: ${row.shard_id}`).toEqual(row.address)
+          }
+        }
+      }).pipe(Effect.scoped, Effect.provide(ShardingConfig.layer())), 120_000)
+
+    it.effect("allocates distinct machine ids to concurrent registrations", () =>
+      Effect.gen(function*() {
+        const storages = yield* Effect.forEach(
+          Array.from({ length: 4 }),
+          () => ClickhouseRunnerStorage.make({ prefix: "machines" })
+        )
+        const runners = Array.from({ length: 12 }, (_, i) =>
+          Runner.make({
+            address: RunnerAddress.make("localhost", 10_000 + i),
+            groups: ["default"],
+            weight: 1
+          }))
+
+        const machineIds = yield* Effect.all(
+          runners.map((runner, i) => storages[i % storages.length].register(runner, true)),
+          { concurrency: "unbounded" }
+        )
+        expect([...machineIds].sort((a, b) => a - b)).toEqual(runners.map((_, i) => i + 1))
+
+        // re-registering keeps the machine id
+        expect(yield* storages[0].register(runners[3], false)).toEqual(machineIds[3])
+        expect(yield* storages[0].getRunners).toHaveLength(runners.length)
+      }).pipe(Effect.scoped, Effect.provide(ShardingConfig.layer())), 60_000)
   })
 })
 

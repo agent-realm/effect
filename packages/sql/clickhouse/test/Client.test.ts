@@ -11,11 +11,12 @@ let connectImmediately = false
 const commandCalls: Array<Record<string, unknown>> = []
 const insertCalls: Array<Record<string, unknown>> = []
 let insertImpl: ((options: Record<string, unknown>) => Promise<unknown>) | undefined
+let queryImpl: ((options: Record<string, unknown>) => Promise<unknown>) | undefined
 
 vi.mock("@clickhouse/client", () => ({
   createClient: () => ({
     ping: () => connectImmediately ? Promise.resolve({ success: true }) : new Promise(() => {}),
-    query: () => new Promise(() => {}),
+    query: (options: Record<string, unknown>) => queryImpl ? queryImpl(options) : new Promise(() => {}),
     insert: (options: Record<string, unknown>) => {
       insertCalls.push(options)
       return insertImpl ? insertImpl(options) : new Promise(() => {})
@@ -128,4 +129,56 @@ describe("ClickhouseClient", { concurrent: false }, () => {
       assert.deepStrictEqual(insertCalls[0].columns, ["name"])
       assert.deepStrictEqual(insertCalls[1].columns, { except: ["id"] })
     }).pipe(Effect.provide(Reactivity.layer)))
+
+  it.effect("returns no rows for statements that answer with an empty body", () =>
+    Effect.gen(function*() {
+      connectImmediately = true
+      queryImpl = () =>
+        Promise.resolve({
+          json: () => Promise.reject(new SyntaxError("Unexpected end of JSON input")),
+          text: () => Promise.resolve("")
+        })
+      const client = yield* ClickhouseClient.make({ url: "http://localhost:8123" })
+
+      const rows = yield* client.unsafe("CREATE TABLE people (name String) ENGINE = Memory")
+
+      assert.deepStrictEqual(rows, [])
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => {
+        queryImpl = undefined
+      })),
+      Effect.scoped,
+      Effect.provide(Reactivity.layer)
+    ))
+
+  it.effect("parses query results with the configured JSON parser", () =>
+    Effect.gen(function*() {
+      connectImmediately = true
+      queryImpl = () =>
+        Promise.resolve({
+          json: () => Promise.reject(new Error("json() is not used")),
+          text: () => Promise.resolve(`{"data":[{"name":"Alice"}]}`)
+        })
+      const parsed: Array<string> = []
+      const client = yield* ClickhouseClient.make({
+        url: "http://localhost:8123",
+        json: {
+          parse: (input) => {
+            parsed.push(input)
+            return JSON.parse(input)
+          }
+        }
+      })
+
+      const rows = yield* client.unsafe("SELECT name FROM people")
+
+      assert.deepStrictEqual(rows, [{ name: "Alice" }])
+      assert.deepStrictEqual(parsed, [`{"data":[{"name":"Alice"}]}`])
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => {
+        queryImpl = undefined
+      })),
+      Effect.scoped,
+      Effect.provide(Reactivity.layer)
+    ))
 })

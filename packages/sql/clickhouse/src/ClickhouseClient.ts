@@ -187,6 +187,7 @@ export const make = (
       Effect.sync(() => Clickhouse.createClient(options)),
       (client) => Effect.promise(() => client.close())
     )
+    const parseJson = options.json?.parse ?? JSON.parse
 
     yield* Effect.tryPromise({
       try: async () => {
@@ -283,7 +284,16 @@ export const make = (
           Effect.flatMap((result) => {
             if ("json" in result) {
               return Effect.tryPromise({
-                try: () => result.json().then((result) => "data" in result ? result.data : result as any),
+                // Statements without output (DDL, INSERT, ALTER) answer with
+                // an empty body, which is not a JSON document.
+                try: () =>
+                  result.text().then((text) => {
+                    if (text.length === 0) {
+                      return []
+                    }
+                    const parsed: any = parseJson(text)
+                    return "data" in parsed ? parsed.data : parsed
+                  }),
                 catch: (cause) =>
                   new SqlError({ reason: classifyError(cause, "Failed to parse result", "parseResult") })
               })

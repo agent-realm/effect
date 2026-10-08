@@ -1,7 +1,9 @@
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
+import { ClickhouseClient, ClickhouseMessageStorage } from "@effect/sql-clickhouse"
+import { type ArchiveHooks, archivePass } from "@effect/sql-clickhouse/internal/messageArchive"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Effect, Exit, Fiber, FileSystem, Latch, Layer, Option } from "effect"
+import { Cause, Effect, Exit, Fiber, FileSystem, Latch, Layer, Option } from "effect"
 import {
   Entity,
   EntityAddress,
@@ -21,6 +23,7 @@ import {
 } from "effect/cluster"
 import { SqlClient } from "effect/sql"
 import { TestClock } from "effect/testing"
+import { ClickhouseContainer } from "../fixtures/clickhouse-utils.ts"
 import { MysqlContainer } from "../fixtures/mysql2-utils.ts"
 import { PgContainer } from "../fixtures/pg-utils.ts"
 import {
@@ -50,14 +53,126 @@ const truncate = Effect.gen(function*() {
   yield* sql`DELETE FROM cluster_messages`
 })
 
+// What the shared tests need to know about a backend's schema.
+interface Backend {
+  readonly label: string
+  readonly layer: Layer.Layer<MessageStorage.MessageStorage | Snowflake.Generator | SqlClient.SqlClient>
+  readonly truncate: Effect.Effect<void, unknown, SqlClient.SqlClient>
+  // The processed state of every message, in insertion order.
+  readonly processedStates: Effect.Effect<unknown, unknown, SqlClient.SqlClient>
+  // The processed state and latest reply of one message.
+  readonly messageState: (id: string) => Effect.Effect<unknown, unknown, SqlClient.SqlClient>
+  // The stored request deduplication keys.
+  readonly storedMessageIds: Effect.Effect<ReadonlyArray<string>, unknown, SqlClient.SqlClient>
+  readonly makeEncoded: Effect.Effect<MessageStorage.Encoded, never, SqlClient.SqlClient>
+}
+
+const sqlBackend = (
+  label: string,
+  layer: Layer.Layer<SqlClient.SqlClient>
+): Backend => ({
+  label,
+  layer: StorageLayer.pipe(Layer.provideMerge(layer)),
+  truncate,
+  processedStates: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`
+  }),
+  messageState: (id) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      return yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${id}`.pipe(
+        Effect.provideService(SqlClient.SafeIntegers, true)
+      )
+    }),
+  storedMessageIds: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
+    return rows.map((row) => row.message_id)
+  }),
+  makeEncoded: SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+})
+
+const clickhouseTables = [
+  "messages",
+  "replies",
+  "reply_acks",
+  "message_ids",
+  "pending",
+  "exits",
+  "exits_archive",
+  "message_ids_archive"
+]
+
+// A message is processed once it has left the pending table, or once its
+// request has an exit.
+const clickhouseBackend: Backend = {
+  label: "clickhouse",
+  layer: ClickhouseMessageStorage.layer.pipe(
+    Layer.provideMerge(Snowflake.layerGenerator),
+    Layer.provide([ShardingConfig.layerDefaults, NodeCrypto.layer]),
+    Layer.provideMerge(Layer.orDie(ClickhouseContainer.layerClient))
+  ),
+  truncate: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    for (const table of clickhouseTables) {
+      yield* sql`TRUNCATE TABLE ${sql(`cluster_${table}`)}`.pipe(
+        Effect.provideService(ClickhouseClient.ClientMethod, "command")
+      )
+    }
+  }),
+  processedStates: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql`
+      SELECT
+        id NOT IN (SELECT id FROM cluster_pending)
+          OR request_id IN (SELECT request_id FROM cluster_exits) AS processed
+      FROM cluster_messages
+      ORDER BY rowid
+    `
+  }),
+  messageState: (id) =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const pending = yield* sql<{ last_reply_id: string | null }>`
+        SELECT last_reply_id FROM cluster_pending WHERE id = ${sql.literal(id)}
+      `
+      const exits = yield* sql<{ reply_id: string }>`
+        SELECT reply_id FROM cluster_exits WHERE request_id = ${sql.literal(id)}
+      `
+      return {
+        processed: pending.length === 0 || exits.length > 0,
+        last_reply_id: exits[0]?.reply_id ?? pending[0]?.last_reply_id ?? null
+      }
+    }).pipe(
+      // Read Snowflake ids exactly, as strings.
+      Effect.provideService(ClickhouseClient.ClickhouseSettings, { output_format_json_quote_64bit_integers: 1 })
+    ),
+  storedMessageIds: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_message_ids`
+    return rows.map((row) => row.message_id)
+  }),
+  // The ClickHouse client layer provides the same client as `SqlClient`.
+  makeEncoded: Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    return yield* ClickhouseMessageStorage.makeEncoded().pipe(
+      Effect.provideService(ClickhouseClient.ClickhouseClient, sql as ClickhouseClient.ClickhouseClient),
+      Effect.provide(NodeCrypto.layer)
+    )
+  })
+}
+
 describe("SqlMessageStorage", () => {
-  ;([
-    ["pg", Layer.orDie(PgContainer.layerClient)],
-    ["mysql", Layer.orDie(MysqlContainer.layerClient)],
-    ["sqlite", Layer.orDie(SqliteLayer)]
-  ] as const).forEach(([label, layer]) => {
+  ;[
+    sqlBackend("pg", Layer.orDie(PgContainer.layerClient)),
+    sqlBackend("mysql", Layer.orDie(MysqlContainer.layerClient)),
+    sqlBackend("sqlite", Layer.orDie(SqliteLayer)),
+    clickhouseBackend
+  ].forEach((backend) => {
+    const { label } = backend
     // Tests truncate this backend's shared tables.
-    it.layer(StorageLayer.pipe(Layer.provideMerge(layer)), {
+    it.layer(backend.layer, {
       concurrent: false,
       timeout: 120000
     })(label, (it) => {
@@ -65,9 +180,9 @@ describe("SqlMessageStorage", () => {
         for (const reset of ["resetShards", "resetAddresses"] as const) {
           it.effect(`${reset} does not deadlock with a concurrent message claim`, () =>
             Effect.gen(function*() {
-              yield* truncate
+              yield* backend.truncate
               const sql = yield* SqlClient.SqlClient
-              const storage = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+              const storage = yield* backend.makeEncoded
               // Heap order is the reverse of the claim query's rowid order.
               yield* sql`
                 INSERT INTO cluster_messages
@@ -124,7 +239,7 @@ describe("SqlMessageStorage", () => {
                 Effect.gen(function*() {
                   yield* sql`DROP TRIGGER cluster_test_slow_reset ON cluster_messages`
                   yield* sql`DROP FUNCTION cluster_test_slow_reset()`
-                  yield* truncate
+                  yield* backend.truncate
                 }).pipe(Effect.orDie)
               ))
             }).pipe(TestClock.withLive))
@@ -143,9 +258,469 @@ describe("SqlMessageStorage", () => {
           }))
       }
 
+      if (label === "clickhouse") {
+        it.effect("SqlMessageStorage refuses a ClickHouse client", () =>
+          Effect.gen(function*() {
+            const exit = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer), Effect.exit)
+            assert(Exit.isFailure(exit))
+            assert.include(String(Cause.squash(exit.cause)), "use ClickhouseMessageStorage")
+          }))
+
+        it.effect("concurrent acknowledgements leave the newest one pending", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 1 }) })
+            yield* storage.saveRequest(request)
+            for (let round = 0; round < 5; round++) {
+              const chunk = yield* makeChunkReply(request, round)
+              yield* storage.saveReply(chunk)
+              const acks = yield* Effect.forEach(Array.from({ length: 4 }), () => makeAckChunk(request, chunk))
+              yield* Effect.all(acks.map((ack) => storage.saveEnvelope(ack)), { concurrency: "unbounded" })
+              const pending = yield* sql<{ id: string }>`
+                SELECT toString(id) AS id FROM cluster_pending WHERE kind = 1
+              `
+              const newest = yield* sql<{ id: string }>`
+                SELECT toString(id) AS id FROM cluster_messages WHERE kind = 1 ORDER BY rowid DESC LIMIT 1
+              `
+              expect(pending.map((row) => row.id), `round ${round}`).toEqual([newest[0].id])
+            }
+          }))
+
+        it.effect("readers remove stale rows of completed requests and rows whose message is gone", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const command = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.provideService(effect, ClickhouseClient.ClientMethod, "command")
+            const completed = yield* makeRequest({ entityId: "1" })
+            const orphan = yield* makeRequest({ entityId: "2" })
+            yield* storage.saveRequest(completed)
+            yield* storage.saveReply(yield* makeReply(completed))
+            yield* storage.saveRequest(orphan)
+            // An exit save that stopped before removing its pending row, long ago.
+            yield* command(sql`
+              INSERT INTO cluster_pending (id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, last_reply_id, last_read, claim, enqueued_at)
+              SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, NULL, NULL, '',
+                now64(3) - INTERVAL 1 HOUR
+              FROM cluster_messages WHERE id = ${sql.literal(String(completed.envelope.requestId))}
+            `)
+            // A pending row whose message a racing clearAddress removed.
+            yield* command(
+              sql`DELETE FROM cluster_messages WHERE id = ${sql.literal(String(orphan.envelope.requestId))}`
+            )
+
+            expect(yield* storage.unprocessedMessages([completed.envelope.address.shardId])).toHaveLength(0)
+            expect(yield* sql`SELECT id FROM cluster_pending`).toHaveLength(0)
+          }))
+
+        it.effect("a clearAddress that stopped part way finishes when retried", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const command = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.provideService(effect, ClickhouseClient.ClientMethod, "command")
+            const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 9 }) })
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(yield* makeChunkReply(request))
+            yield* storage.saveReply(yield* makeReply(request))
+            // The first steps ran, the messages are still there.
+            yield* command(sql`TRUNCATE TABLE cluster_pending`)
+            yield* command(sql`TRUNCATE TABLE cluster_exits`)
+
+            yield* storage.clearAddress(request.envelope.address)
+            for (const table of ["messages", "replies", "message_ids", "pending", "exits"]) {
+              expect(yield* sql`SELECT 1 FROM ${sql(`cluster_${table}`)}`, table).toHaveLength(0)
+            }
+            const again = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 9 }) })
+            expect((yield* storage.saveRequest(again))._tag).toEqual("Success")
+          }))
+
+        it.effect("a clearReplies stopped before removing the exit keeps the request hidden", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+            // The state a stop leaves between requeueing and removing the exit.
+            const id = sql.literal(String(request.envelope.requestId))
+            yield* sql`
+              INSERT INTO cluster_pending (id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, last_reply_id, last_read, claim)
+              SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, NULL, NULL, ''
+              FROM cluster_messages WHERE id = ${id}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+            const shard = [request.envelope.address.shardId]
+            expect(yield* storage.unprocessedMessages(shard)).toHaveLength(0)
+            expect(yield* sql`SELECT id FROM cluster_pending WHERE id = ${id}`).toHaveLength(1)
+
+            // Running the clear again completes it.
+            yield* storage.clearReplies(request.envelope.requestId, { expectedReplyId: reply.reply.id })
+            expect(yield* storage.repliesFor([request])).toHaveLength(0)
+            const messages = yield* storage.unprocessedMessages(shard)
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([request.envelope.requestId])
+          }))
+
+        it.effect("a key left behind by clearAddress does not swallow the next save", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const removed = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 321 })
+            })
+            yield* storage.saveRequest(removed)
+            yield* storage.clearAddress(removed.envelope.address)
+            // A save that recorded its key after the clear removed its message.
+            const key = Envelope.primaryKey(removed.envelope)!
+            yield* sql`
+              INSERT INTO cluster_message_ids (message_id, id)
+              SELECT ${key}, ${sql.literal(String(removed.envelope.requestId))}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: removed.envelope.address,
+                tag: removed.envelope.tag,
+                id: "321"
+              })
+            ).toEqual(Option.none())
+
+            const next = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 321 })
+            })
+            expect((yield* storage.saveRequest(next))._tag).toEqual("Success")
+            const messages = yield* storage.unprocessedMessages([next.envelope.address.shardId])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([next.envelope.requestId])
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: next.envelope.address,
+                tag: next.envelope.tag,
+                id: "321"
+              })
+            ).toEqual(Option.some(next.envelope.requestId))
+          }))
+
+        it.effect("reads mailboxes longer than one statement can list", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const encoded = yield* backend.makeEncoded
+            const command = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.provideService(effect, ClickhouseClient.ClientMethod, "command")
+            // Ids as long as real Snowflakes, so the id lists are realistic.
+            const count = 2500
+            yield* command(sql`
+              INSERT INTO cluster_messages (id, shard_id, entity_type, entity_id, kind, tag, payload, headers, request_id)
+              SELECT -7280009832000000000 + number, 'default:1', 'test', toString(number), 0, 'GetUser', '{"id":1}', '{}',
+                -7280009832000000000 + number
+              FROM numbers(${sql.literal(String(count))})
+            `)
+            yield* command(sql`
+              INSERT INTO cluster_pending (id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, last_reply_id, last_read, claim)
+              SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, NULL, NULL, ''
+              FROM cluster_messages
+            `)
+            const shard = ShardId.make("default", 1)
+            const addresses = Array.from({ length: 3000 }, (_, i) =>
+              EntityAddress.make({
+                shardId: shard,
+                entityType: EntityType.make("test"),
+                entityId: EntityId.make(String(i))
+              }))
+            const batch = yield* encoded.unprocessedMessages([shard.toString()], Date.now(), { limit: 1024, addresses })
+            expect(batch).toHaveLength(1024)
+            const rest = yield* encoded.unprocessedMessages([shard.toString()], Date.now())
+            expect(rest).toHaveLength(count - 1024)
+            const claimed = [...batch, ...rest].map((message) => message.envelope.address.entityId)
+            expect(new Set(claimed).size).toEqual(count)
+            yield* encoded.resetAddresses(addresses)
+            expect(yield* encoded.unprocessedMessages([shard.toString()], Date.now())).toHaveLength(count)
+          }))
+
+        // Archiving: a pass with no retention moves every completed request.
+        const archiveNow = (hooks?: ArchiveHooks) =>
+          Effect.gen(function*() {
+            // The ClickHouse client layer provides the same client as `SqlClient`.
+            const client = (yield* SqlClient.SqlClient) as ClickhouseClient.ClickhouseClient
+            return yield* archivePass({ client, retention: 0, hooks })
+          })
+        const count = (query: string) =>
+          Effect.gen(function*() {
+            const sql = yield* SqlClient.SqlClient
+            const rows = yield* sql.unsafe<{ n: string }>(`SELECT toString(count()) AS n FROM ${query}`)
+            return Number(rows[0].n)
+          })
+
+        it.effect("an archived exit still resumes", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+            expect(yield* archiveNow()).toEqual({ archived: 1, compensated: 0 })
+            expect(yield* count("cluster_exits")).toEqual(0)
+            expect(yield* count("cluster_exits_archive")).toEqual(1)
+
+            // The archived exit is still the request's reply.
+            expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([reply.reply.id])
+            expect((yield* storage.repliesForUnfiltered([request.envelope.requestId])).map((r) => String(r.id)))
+              .toEqual([
+                String(reply.reply.id)
+              ])
+
+            yield* storage.clearReplies(request.envelope.requestId, { expectedReplyId: reply.reply.id })
+            expect(yield* storage.repliesFor([request])).toHaveLength(0)
+            expect(yield* count("cluster_exits_archive")).toEqual(0)
+            const messages = yield* storage.unprocessedMessages([request.envelope.address.shardId])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([request.envelope.requestId])
+          }))
+
+        it.effect("archived keys still deduplicate and name their request", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 555 })
+            })
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+            yield* archiveNow()
+            expect(yield* count("cluster_message_ids")).toEqual(0)
+            expect(yield* count("cluster_message_ids_archive")).toEqual(1)
+
+            const duplicate = yield* storage.saveRequest(
+              yield* makeRequest({ rpc: PrimaryKeyTest, payload: PrimaryKeyTest.payloadSchema.make({ id: 555 }) })
+            )
+            assert(duplicate._tag === "Duplicate" && Option.isSome(duplicate.lastReceivedReply))
+            expect(duplicate.originalId).toEqual(request.envelope.requestId)
+            expect(duplicate.lastReceivedReply.value._tag).toEqual("WithExit")
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: request.envelope.address,
+                tag: request.envelope.tag,
+                id: "555"
+              })
+            ).toEqual(Option.some(request.envelope.requestId))
+            expect(yield* count("cluster_message_ids")).toEqual(0)
+          }))
+
+        it.effect("an interrupt for an archived request stays undelivered", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const snowflake = yield* Snowflake.Generator
+            const request = yield* makeRequest()
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(yield* makeReply(request))
+            yield* archiveNow()
+            yield* storage.saveEnvelope(
+              new Message.OutgoingEnvelope({
+                envelope: new Envelope.Interrupt({
+                  id: snowflake.nextUnsafe(),
+                  address: request.envelope.address,
+                  requestId: request.envelope.requestId
+                }),
+                rpc: request.rpc
+              })
+            )
+            expect(yield* storage.unprocessedMessages([request.envelope.address.shardId])).toHaveLength(0)
+          }))
+
+        it.effect("concurrent resumes and archive passes converge", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+            yield* archiveNow()
+            yield* Effect.all([
+              storage.clearReplies(request.envelope.requestId, { expectedReplyId: reply.reply.id }),
+              archiveNow(),
+              archiveNow(),
+              archiveNow()
+            ], { concurrency: "unbounded", discard: true })
+            yield* archiveNow()
+
+            expect(yield* storage.repliesFor([request])).toHaveLength(0)
+            const messages = yield* storage.unprocessedMessagesById([request.envelope.requestId])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([request.envelope.requestId])
+          }))
+
+        it.effect("clearAddress removes archived entries", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 777 })
+            })
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(yield* makeReply(request))
+            yield* archiveNow()
+            yield* storage.clearAddress(request.envelope.address)
+            expect(yield* count("cluster_exits_archive")).toEqual(0)
+            expect(yield* count("cluster_message_ids_archive")).toEqual(0)
+            const again = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 777 })
+            })
+            expect((yield* storage.saveRequest(again))._tag).toEqual("Success")
+          }))
+
+        it.effect("a resume between an archive pass's read and write wins", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+            const id = request.envelope.requestId
+
+            // The pass reads the exit, then a resume clears and requeues the
+            // request, then the pass archives what it read.
+            const result = yield* archiveNow({
+              afterRead: () => Effect.orDie(storage.clearReplies(id, { expectedReplyId: reply.reply.id }))
+            })
+            expect(result).toEqual({ archived: 0, compensated: 1 })
+            expect(yield* count("cluster_exits_archive")).toEqual(0)
+            const assertRequeued = Effect.gen(function*() {
+              expect(yield* storage.repliesFor([request])).toHaveLength(0)
+              const messages = yield* storage.unprocessedMessagesById([id])
+              expect(messages.map((message) => message.envelope.requestId)).toEqual([id])
+            })
+            yield* assertRequeued
+
+            // A pass that stopped before removing its row leaves a stale one:
+            // Keeper still holds the pending request, so it decides.
+            yield* sql`
+              INSERT INTO cluster_exits_archive (request_id, reply_id)
+              SELECT ${sql.literal(String(id))}, ${sql.literal(String(reply.reply.id))}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+            yield* assertRequeued
+          }))
+
+        it.effect("a request saved again while its exit is archived stays complete", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const request = yield* makeRequest()
+            const reply = yield* makeReply(request)
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(reply)
+
+            // A retried send saves the request again right after the pass
+            // removed the exit from Keeper and before it checks Keeper.
+            const result = yield* archiveNow({
+              afterKeeperDelete: () => Effect.orDie(Effect.asVoid(storage.saveRequest(request)))
+            })
+            expect(result).toEqual({ archived: 1, compensated: 0 })
+            expect(yield* count("cluster_pending")).toEqual(0)
+            expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([reply.reply.id])
+
+            // And again after archiving.
+            expect((yield* storage.saveRequest(request))._tag).toEqual("Success")
+            expect(yield* count("cluster_pending")).toEqual(0)
+            expect(yield* storage.unprocessedMessages([request.envelope.address.shardId])).toHaveLength(0)
+            expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([reply.reply.id])
+          }))
+
+        it.effect("a key archived for a request that was then removed is taken over", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const removed = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 888 })
+            })
+            yield* storage.saveRequest(removed)
+            yield* storage.saveReply(yield* makeReply(removed))
+            yield* archiveNow()
+            yield* storage.clearAddress(removed.envelope.address)
+            // A pass racing the clear archives the key again after the clear.
+            yield* sql`
+              INSERT INTO cluster_message_ids_archive (message_id, id)
+              SELECT ${Envelope.primaryKey(removed.envelope)!}, ${sql.literal(String(removed.envelope.requestId))}
+            `.pipe(Effect.provideService(ClickhouseClient.ClientMethod, "command"))
+
+            const next = yield* makeRequest({
+              rpc: PrimaryKeyTest,
+              payload: PrimaryKeyTest.payloadSchema.make({ id: 888 })
+            })
+            expect((yield* storage.saveRequest(next))._tag).toEqual("Success")
+            expect(
+              yield* storage.requestIdForPrimaryKey({
+                address: next.envelope.address,
+                tag: next.envelope.tag,
+                id: "888"
+              })
+            ).toEqual(Option.some(next.envelope.requestId))
+            const messages = yield* storage.unprocessedMessages([next.envelope.address.shardId])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([next.envelope.requestId])
+          }))
+
+        it.effect("concurrent readers never claim the same message", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const encoded = yield* backend.makeEncoded
+            const shardId = ShardId.make("default", 1).toString()
+            for (let i = 1; i <= 20; i++) {
+              yield* storage.saveRequest(yield* makeRequest({ payload: { id: i }, entityId: String(i) }))
+            }
+            const reads = yield* Effect.all(
+              Array.from({ length: 4 }, () => encoded.unprocessedMessages([shardId], Date.now())),
+              { concurrency: "unbounded" }
+            )
+            const claimed = reads.flat().map((message) =>
+              message.envelope._tag === "Request" ? message.envelope.requestId : message.envelope.id
+            )
+            expect(claimed).toHaveLength(20)
+            expect(new Set(claimed).size).toEqual(20)
+          }))
+
+        it.effect("concurrent saves of one primary key keep a single request", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const storage = yield* MessageStorage.MessageStorage
+            const requests = yield* Effect.forEach(
+              Array.from({ length: 8 }),
+              () => makeRequest({ rpc: PrimaryKeyTest, payload: PrimaryKeyTest.payloadSchema.make({ id: 789 }) })
+            )
+            const results = yield* Effect.all(requests.map((request) => storage.saveRequest(request)), {
+              concurrency: "unbounded"
+            })
+            const saved = requests.filter((_, i) => results[i]._tag === "Success")
+            expect(saved).toHaveLength(1)
+            for (const result of results) {
+              if (result._tag === "Duplicate") {
+                expect(result.originalId).toEqual(saved[0].envelope.requestId)
+              }
+            }
+            const messages = yield* storage.unprocessedMessages([ShardId.make("default", 1)])
+            expect(messages.map((message) => message.envelope.requestId)).toEqual([saved[0].envelope.requestId])
+            expect(yield* backend.storedMessageIds).toHaveLength(1)
+          }))
+      }
+
       it.effect("resetRequests with no IDs leaves existing claims untouched", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
@@ -156,7 +731,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("resetRequests releases only the selected request at a shared address", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const selected = yield* makeRequest()
           const unrelated = yield* makeRequest()
@@ -172,7 +747,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("resetRequests preserves chunk replies, exit replies, and completed state", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const streaming = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 123 }) })
           const completed = yield* makeRequest()
@@ -185,20 +760,19 @@ describe("SqlMessageStorage", () => {
           const replies = yield* storage.repliesFor([streaming, completed])
           expect(replies).toHaveLength(2)
           expect(yield* storage.unprocessedMessages(shards)).toHaveLength(0)
-          const sql = yield* SqlClient.SqlClient
-          const processed = yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`
+          const processed = yield* backend.processedStates
           yield* storage.resetRequests([streaming.envelope.requestId, completed.envelope.requestId])
           const messages = yield* storage.unprocessedMessages(shards)
           // Replies keep both requests out of the SQL read loop.
           expect(messages).toHaveLength(0)
           expect(yield* storage.repliesFor([streaming, completed])).toEqual(replies)
-          expect(yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`).toEqual(processed)
-          yield* truncate
+          expect(yield* backend.processedStates).toEqual(processed)
+          yield* backend.truncate
         }))
 
       it.effect("clearReplies requeues when the expected reply is current", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           const reply = yield* makeReply(request)
@@ -211,8 +785,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("clearReplies with a stale expected reply preserves a newer completion and processed state", () =>
         Effect.gen(function*() {
-          yield* truncate
-          const sql = yield* SqlClient.SqlClient
+          yield* backend.truncate
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 123 }) })
           const oldReply = yield* makeChunkReply(request)
@@ -220,21 +793,15 @@ describe("SqlMessageStorage", () => {
           yield* storage.saveRequest(request)
           yield* storage.saveReply(oldReply)
           yield* storage.saveReply(completed)
-          const before = yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${
-            String(request.envelope.requestId)
-          }`.pipe(Effect.provideService(SqlClient.SafeIntegers, true))
+          const before = yield* backend.messageState(String(request.envelope.requestId))
           yield* storage.clearReplies(request.envelope.requestId, { expectedReplyId: oldReply.reply.id })
           expect((yield* storage.repliesFor([request])).map((r) => r.id)).toEqual([
             oldReply.reply.id,
             completed.reply.id
           ])
-          expect(
-            yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${
-              String(request.envelope.requestId)
-            }`.pipe(Effect.provideService(SqlClient.SafeIntegers, true))
-          ).toEqual(before)
+          expect(yield* backend.messageState(String(request.envelope.requestId))).toEqual(before)
           expect(yield* storage.unprocessedMessages([request.envelope.address.shardId])).toHaveLength(0)
-          yield* truncate
+          yield* backend.truncate
         }))
 
       it.effect("saveRequest", () =>
@@ -318,7 +885,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("detects duplicates", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           yield* storage.saveRequest(
@@ -338,7 +905,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("hashes primary keys longer than the message_id column", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const longId = "long-key-".repeat(50)
@@ -364,17 +931,15 @@ describe("SqlMessageStorage", () => {
           })
           expect(requestId).toEqual(Option.some(request.envelope.requestId))
 
-          const sql = yield* SqlClient.SqlClient
-          const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
-          expect(rows).toHaveLength(1)
-          expect(rows[0].message_id).toMatch(/^[0-9a-f]{64}$/)
+          const messageIds = yield* backend.storedMessageIds
+          expect(messageIds).toHaveLength(1)
+          expect(messageIds[0]).toMatch(/^[0-9a-f]{64}$/)
         }))
 
       it.effect("keeps primary keys within the column width as plaintext", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
-          const sql = yield* SqlClient.SqlClient
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest({
             rpc: PrimaryKeyTest,
@@ -385,9 +950,9 @@ describe("SqlMessageStorage", () => {
           // rows written by previous versions store the plaintext composed
           // key, so short keys must stay byte-identical to keep deduplicating
           const plaintext = Envelope.primaryKey(request.envelope)!
-          const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
-          expect(rows).toHaveLength(1)
-          expect(rows[0].message_id).toEqual(plaintext)
+          const messageIds = yield* backend.storedMessageIds
+          expect(messageIds).toHaveLength(1)
+          expect(messageIds[0]).toEqual(plaintext)
 
           const result = yield* storage.saveRequest(
             yield* makeRequest({
@@ -412,7 +977,7 @@ describe("SqlMessageStorage", () => {
         // than the 255-character limit of the width-enforcing dialects
         it.effect("detects duplicates for legacy long-key plaintext rows", () =>
           Effect.gen(function*() {
-            yield* truncate
+            yield* backend.truncate
 
             const sql = yield* SqlClient.SqlClient
             const storage = yield* MessageStorage.MessageStorage
@@ -450,7 +1015,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
@@ -466,7 +1031,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages honors the limit and claims only returned rows", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardId = ShardId.make("default", 1)
@@ -485,7 +1050,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages filters by address", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardId = ShardId.make("default", 1)
@@ -510,7 +1075,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages filters addresses by shard", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardOne = ShardId.make("default", 1)
@@ -533,12 +1098,12 @@ describe("SqlMessageStorage", () => {
 
       it.effect("encoded unprocessedMessages fails closed for empty addresses", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
-          const encoded = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+          const encoded = yield* backend.makeEncoded
           const shardId = request.envelope.address.shardId.toString()
           const messages = yield* encoded.unprocessedMessages([shardId], Date.now(), { addresses: [] })
           expect(messages).toHaveLength(0)
@@ -549,12 +1114,12 @@ describe("SqlMessageStorage", () => {
 
       it.effect("encoded resetAddresses fails closed for an empty address list", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
           yield* storage.saveRequest(request)
-          const encoded = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+          const encoded = yield* backend.makeEncoded
           const shardId = request.envelope.address.shardId.toString()
           const claimed = yield* encoded.unprocessedMessages([shardId], Date.now())
           expect(claimed).toHaveLength(1)
@@ -566,7 +1131,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("resetAddresses releases claims in one batch", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const shardId = ShardId.make("default", 1)
@@ -588,7 +1153,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessages excludes complete requests", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
@@ -600,7 +1165,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("repliesFor", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest()
@@ -633,7 +1198,7 @@ describe("SqlMessageStorage", () => {
 
       it.effect("unprocessedMessagesById", () =>
         Effect.gen(function*() {
-          yield* truncate
+          yield* backend.truncate
 
           const storage = yield* MessageStorage.MessageStorage
           const request = yield* makeRequest({
@@ -649,7 +1214,7 @@ describe("SqlMessageStorage", () => {
           const ack = yield* makeAckChunk(request, chunk)
           yield* storage.saveEnvelope(ack)
 
-          const encoded = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer))
+          const encoded = yield* backend.makeEncoded
           const acknowledgements = yield* encoded.unprocessedMessagesById([ack.envelope.id], 0)
           expect(acknowledgements).toHaveLength(1)
           assert(acknowledgements[0].envelope._tag === "AckChunk")

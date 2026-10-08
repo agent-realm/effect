@@ -490,6 +490,9 @@ importers:
         specifier: ^8.11.2
         version: 8.11.2
     devDependencies:
+      '@testcontainers/clickhouse':
+        specifier: ^12.2.0
+        version: 12.2.0(supports-color@10.2.2)
       '@testcontainers/mysql':
         specifier: ^12.2.0
         version: 12.2.0(supports-color@10.2.2)
@@ -3208,6 +3211,9 @@ packages:
     engines: {node: '>=16.0.0'}
     cpu: [x64, ia32]
     os: [win32]
+
+  '@testcontainers/clickhouse@12.2.0':
+    resolution: {integrity: sha512-xEE9mizEY2T3nWnH2AKm8HysGp6m2amxkxr4gxeGwvc5l/Nb4WuFz7mmbwD/lZ0Fcykp0c2nPXn5lFpb1gZs7A==}
 
   '@testcontainers/mssqlserver@12.2.0':
     resolution: {integrity: sha512-TKqljdFoPiAPztyoHY5jRpkoMK7YrMz3g0/icJQ1bhMzwi7vo3TyDKjAbiPt0sPEdNmJSXapWw4o7On86arbgw==}
@@ -8648,6 +8654,15 @@ snapshots:
 
   '@sqliteai/sqlite-vector-win32-x86_64@1.0.0':
     optional: true
+
+  '@testcontainers/clickhouse@12.2.0(supports-color@10.2.2)':
+    dependencies:
+      testcontainers: 12.2.0(supports-color@10.2.2)
+    transitivePeerDependencies:
+      - bare-abort-controller
+      - bare-buffer
+      - react-native-b4a
+      - supports-color
 
   '@testcontainers/mssqlserver@12.2.0(supports-color@10.2.2)':
     dependencies:
