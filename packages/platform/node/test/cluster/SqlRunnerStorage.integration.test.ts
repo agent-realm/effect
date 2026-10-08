@@ -614,6 +614,17 @@ describe("ClickhouseRunnerStorage", () => {
       it.effect("acquireShards", () => acquireShards)
     })
 
+    it.effect("SqlRunnerStorage refuses a ClickHouse client", () =>
+      Effect.gen(function*() {
+        const exit = yield* SqlRunnerStorage.make({ prefix: "refused" }).pipe(
+          Effect.scoped,
+          Effect.provide(ShardingConfig.layer()),
+          Effect.exit
+        )
+        assert(Exit.isFailure(exit))
+        assert.include(String(Cause.squash(exit.cause)), "use ClickhouseRunnerStorage")
+      }))
+
     it.effect("excludes other storages using the same prefix", () =>
       Effect.gen(function*() {
         const storageA = yield* ClickhouseRunnerStorage.make({ prefix: "exclusive" })

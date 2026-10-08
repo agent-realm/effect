@@ -37,6 +37,7 @@ import type { Fragment } from "../sql/Statement.ts"
 import { PersistenceError } from "./ClusterError.ts"
 import type * as EntityAddress from "./EntityAddress.ts"
 import type * as Envelope from "./Envelope.ts"
+import { rejectClickhouse } from "./internal/sqlDialect.ts"
 import * as MessageStorage from "./MessageStorage.ts"
 import { SaveResultEncoded } from "./MessageStorage.ts"
 import type * as Reply from "./Reply.ts"
@@ -84,6 +85,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     readonly prefix?: string | undefined
   } | undefined
 ) {
+  yield* rejectClickhouse("SqlMessageStorage", "ClickhouseMessageStorage")
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
   const crypto = yield* Crypto.Crypto
   const prefix = options?.prefix ?? "cluster"
@@ -1123,10 +1125,13 @@ export const migrations = (options?: {
 const runMessageMigrations = (options?: {
   readonly prefix?: string | undefined
 }): Effect.Effect<void, never, SqlClient.SqlClient> =>
-  Migrator.make({})({
-    loader: migrations(options),
-    table: `${options?.prefix ?? "cluster"}_migrations`
-  }).pipe(Effect.asVoid, Effect.orDie)
+  Effect.andThen(
+    rejectClickhouse("SqlMessageStorage", "ClickhouseMessageStorage"),
+    Migrator.make({})({
+      loader: migrations(options),
+      table: `${options?.prefix ?? "cluster"}_migrations`
+    }).pipe(Effect.asVoid, Effect.orDie)
+  )
 
 /**
  * Runs the SQL message storage migrations without providing storage.

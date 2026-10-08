@@ -2,7 +2,7 @@ import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { ClickhouseClient, ClickhouseMessageStorage } from "@effect/sql-clickhouse"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, expect, it } from "@effect/vitest"
-import { Effect, Exit, Fiber, FileSystem, Latch, Layer, Option } from "effect"
+import { Cause, Effect, Exit, Fiber, FileSystem, Latch, Layer, Option } from "effect"
 import {
   Entity,
   EntityAddress,
@@ -249,6 +249,13 @@ describe("SqlMessageStorage", () => {
       }
 
       if (label === "clickhouse") {
+        it.effect("SqlMessageStorage refuses a ClickHouse client", () =>
+          Effect.gen(function*() {
+            const exit = yield* SqlMessageStorage.makeEncoded().pipe(Effect.provide(NodeCrypto.layer), Effect.exit)
+            assert(Exit.isFailure(exit))
+            assert.include(String(Cause.squash(exit.cause)), "use ClickhouseMessageStorage")
+          }))
+
         it.effect("concurrent readers never claim the same message", () =>
           Effect.gen(function*() {
             yield* backend.truncate

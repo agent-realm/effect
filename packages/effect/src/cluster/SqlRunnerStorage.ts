@@ -30,6 +30,7 @@ import type * as Statement from "../sql/Statement.ts"
 import { PersistenceError } from "./ClusterError.ts"
 import { ResourceRef } from "./internal/resourceRef.ts"
 import { effectiveInterval } from "./internal/shardLock.ts"
+import { rejectClickhouse } from "./internal/sqlDialect.ts"
 import * as RunnerStorage from "./RunnerStorage.ts"
 import * as ShardId from "./ShardId.ts"
 import * as ShardingConfig from "./ShardingConfig.ts"
@@ -50,6 +51,7 @@ const postgresLockNamespace = (prefix: string): number => {
 const makeStorage = Effect.fnUntraced(function*(options: {
   readonly prefix?: string | undefined
 }) {
+  yield* rejectClickhouse("SqlRunnerStorage", "ClickhouseRunnerStorage")
   const config = yield* ShardingConfig.ShardingConfig
   const shardGroups = ShardingConfig.shardGroupConfig(config)
   const availableShardGroups = Array.from(shardGroups.available)
@@ -810,11 +812,14 @@ export const migrations = (options: {
 const runRunnerMigrations = (options: {
   readonly prefix?: string | undefined
 }): Effect.Effect<void, never, SqlClient.SqlClient> =>
-  Migrator.make({})({
-    loader: migrations(options),
-    // Message and runner migration ids overlap, so keep separate histories.
-    table: `${options.prefix ?? "cluster"}_runner_migrations`
-  }).pipe(Effect.asVoid, Effect.orDie)
+  Effect.andThen(
+    rejectClickhouse("SqlRunnerStorage", "ClickhouseRunnerStorage"),
+    Migrator.make({})({
+      loader: migrations(options),
+      // Message and runner migration ids overlap, so keep separate histories.
+      table: `${options.prefix ?? "cluster"}_runner_migrations`
+    }).pipe(Effect.asVoid, Effect.orDie)
+  )
 
 /**
  * Runs the SQL runner storage migrations without providing storage.
