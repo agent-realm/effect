@@ -117,6 +117,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
   const nullable = (type: string, value: unknown) => client.param(`Nullable(${type})`, value ?? null)
   const emptyFragment = sql.literal("")
   const unclaimed = sql.literal(`(last_read IS NULL OR last_read < now64(3) - INTERVAL 10 MINUTE)`)
+  const staleBefore = sql.literal(`now64(3) - INTERVAL 10 MINUTE`)
 
   // The composed primary key can exceed 255 characters. Keys that fit are
   // stored as-is, matching the SQL storage; longer keys are stored as a
@@ -317,9 +318,13 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       owners.set(String(messageId), String(id))
     }
     const losers: Array<string> = []
+    const stale: Array<string> = []
     const ready: Array<PendingRow> = []
     for (const candidate of candidates) {
       if (completed.has(candidate.request_id)) {
+        if (candidate.stale) {
+          stale.push(candidate.id)
+        }
         continue
       }
       if (candidate.message_id !== null) {
@@ -341,6 +346,14 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       }
     }
     yield* dequeue(losers)
+    // Rows of completed requests left behind by an interrupted exit save are
+    // removed once older than a claim lease. A `clearReplies` requeues before
+    // it removes the exit and refreshes `enqueued_at`, so its rows are kept.
+    yield* forChunks(stale, idChunk, (chunk) =>
+      retryOnConflict(strict(sql`
+        ALTER TABLE ${pendingTable}
+        DELETE WHERE id IN ${ids(chunk)} AND enqueued_at < ${staleBefore}
+      `)).pipe(Effect.as([])))
     return ready
   })
   const deliverable = (candidates: ReadonlyArray<PendingRow>) => forChunks(candidates, idChunk, deliverableChunk)
@@ -373,6 +386,10 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     const lastReply = new Map(
       rows.map((row) => [row.id, row.last_reply_id === null ? undefined : replies.get(row.last_reply_id)])
     )
+    // Pending rows are copied from their message, so one without a message
+    // lost it to a `clearAddress` racing its save.
+    const found = new Set(messages.map((message) => String(message.id)))
+    yield* dequeue(rows.flatMap((row) => found.has(row.id) ? [] : [row.id]))
     return messages.map((message) => messageFromRow(message, lastReply.get(String(message.id))))
   })
   // `rows` are in insertion order, so the chunks come back in that order too.
@@ -380,7 +397,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
 
   const pendingRows = (filter: Statement.Fragment) =>
     sql<PendingRow>`
-      SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, last_reply_id
+      SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, last_reply_id,
+        enqueued_at < ${staleBefore} AS stale
       FROM ${pendingTable}
       WHERE ${filter}
       ORDER BY rowid ASC
@@ -394,7 +412,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         shard_id: row.shard_id,
         entity_type: row.entity_type,
         entity_id: row.entity_id,
-        last_reply_id: row.last_reply_id === null ? null : String(row.last_reply_id)
+        last_reply_id: row.last_reply_id === null ? null : String(row.last_reply_id),
+        stale: Boolean(row.stale)
       }))
     ))
 
@@ -508,17 +527,20 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
               SELECT ${int64(envelope.replyId)}, ${int64(envelope.requestId)}
             `)
             // Only the latest acknowledgement of a request stays unprocessed.
-            // The new one is stored before older ones are removed, and "older"
-            // is by insertion order, so concurrent saves keep the newest.
-            const [self] = yield* sql`SELECT rowid FROM ${pendingTable} WHERE id IN ${ids([row.id])}`.values
-            if (self !== undefined) {
-              yield* retryOnConflict(strict(sql`
-                ALTER TABLE ${pendingTable}
-                DELETE WHERE request_id = ${int64(envelope.requestId)}
-                AND kind = ${sql.literal(String(messageKind.AckChunk))}
-                AND rowid < ${client.param("UInt64", String(self[0]))}
-              `))
-            }
+            // The new one is stored first, then every pending one older than
+            // the newest pending one (by insertion order) is removed, so
+            // whichever concurrent save cleans up last keeps the newest.
+            const ackKind = sql.literal(String(messageKind.AckChunk))
+            const [[newest]] = yield* sql`
+              SELECT max(rowid) FROM ${pendingTable}
+              WHERE request_id = ${int64(envelope.requestId)} AND kind = ${ackKind}
+            `.values
+            yield* retryOnConflict(strict(sql`
+              ALTER TABLE ${pendingTable}
+              DELETE WHERE request_id = ${int64(envelope.requestId)}
+              AND kind = ${ackKind}
+              AND rowid < ${client.param("UInt64", String(newest))}
+            `))
           }
           return SaveResultEncoded.Success()
         }
@@ -699,11 +721,12 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
           withTracerDisabled
         ),
 
-    // Removes what exists now, by id rather than by address: a save that
-    // stores its message after this read is left whole, and one that stored
-    // it before loses the message first, so it cannot enqueue it afterwards
-    // (pending rows are copied from the message). A key such a save records
-    // late is taken over by the next save of that key.
+    // Removes what exists now, by id rather than by address, so a save that
+    // stores its message after this read is left whole. The messages go last,
+    // so a clear that stopped part way finds them again when it is retried.
+    // A save racing the clear can still leave a pending row whose message is
+    // gone, which readers drop, or a key whose request is gone, which the
+    // next save of that key takes over.
     clearAddress: (address) =>
       Effect.gen(function*() {
         const rows = yield* sql`
@@ -713,8 +736,6 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         const messageIds = Array.from(new Set(rows.map((row) => String(row[0]))))
         const requestIds = Array.from(new Set(rows.map((row) => String(row[1]))))
         const keys = rows.flatMap((row) => row[2] === null ? [] : [[String(row[2]), String(row[1])] as const])
-        yield* forChunks(messageIds, idChunk, (chunk) =>
-          command(sql`DELETE FROM ${messagesTable} WHERE id IN ${ids(chunk)}`).pipe(Effect.as([])))
         yield* dequeue(messageIds)
         yield* forChunks(requestIds, idChunk, (chunk) =>
           Effect.gen(function*() {
@@ -726,11 +747,11 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         yield* forChunks(keys, keyChunk, (chunk) =>
           retryOnConflict(strict(sql`
             ALTER TABLE ${messageIdsTable}
-            DELETE WHERE message_id IN ${
-            strings(chunk.map(([key]) => key))
-          }
+            DELETE WHERE message_id IN ${strings(chunk.map(([key]) => key))}
             AND id IN ${ids(chunk.map(([, requestId]) => requestId))}
           `)).pipe(Effect.as([])))
+        yield* forChunks(messageIds, idChunk, (chunk) =>
+          command(sql`DELETE FROM ${messagesTable} WHERE id IN ${ids(chunk)}`).pipe(Effect.as([])))
       }).pipe(
         quoted,
         PersistenceError.refail,
@@ -848,7 +869,8 @@ export const migrations = (options?: {
         deliver_at Nullable(Int64),
         last_reply_id Nullable(Int64),
         last_read Nullable(DateTime64(3)),
-        claim String`,
+        claim String,
+        enqueued_at DateTime64(3) DEFAULT now64(3)`,
         "id"
       )
       yield* keeperMap(tables.exits, `request_id Int64, reply_id Int64`, "request_id")
@@ -1181,6 +1203,7 @@ type PendingRow = {
   readonly entity_type: string
   readonly entity_id: string
   readonly last_reply_id: string | null
+  readonly stale: boolean
 }
 
 // Snowflake ids inline as about 20 characters, keys as up to 257, against a

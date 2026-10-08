@@ -263,19 +263,70 @@ describe("SqlMessageStorage", () => {
             const storage = yield* MessageStorage.MessageStorage
             const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 1 }) })
             yield* storage.saveRequest(request)
-            const chunk = yield* makeChunkReply(request)
-            yield* storage.saveReply(chunk)
-            const acks = yield* Effect.forEach(Array.from({ length: 4 }), () => makeAckChunk(request, chunk))
-            yield* Effect.all(acks.map((ack) => storage.saveEnvelope(ack)), { concurrency: "unbounded" })
-            const pending = yield* sql<{ id: string }>`
-              SELECT toString(p.id) AS id FROM cluster_pending p
-              INNER JOIN cluster_messages m ON m.id = p.id
-              WHERE p.kind = 1 ORDER BY m.rowid DESC
-            `
-            const newest = yield* sql<{ id: string }>`
-              SELECT toString(id) AS id FROM cluster_messages WHERE kind = 1 ORDER BY rowid DESC LIMIT 1
-            `
-            expect(pending.map((row) => row.id)).toEqual([newest[0].id])
+            for (let round = 0; round < 5; round++) {
+              const chunk = yield* makeChunkReply(request, round)
+              yield* storage.saveReply(chunk)
+              const acks = yield* Effect.forEach(Array.from({ length: 4 }), () => makeAckChunk(request, chunk))
+              yield* Effect.all(acks.map((ack) => storage.saveEnvelope(ack)), { concurrency: "unbounded" })
+              const pending = yield* sql<{ id: string }>`
+                SELECT toString(id) AS id FROM cluster_pending WHERE kind = 1
+              `
+              const newest = yield* sql<{ id: string }>`
+                SELECT toString(id) AS id FROM cluster_messages WHERE kind = 1 ORDER BY rowid DESC LIMIT 1
+              `
+              expect(pending.map((row) => row.id), `round ${round}`).toEqual([newest[0].id])
+            }
+          }))
+
+        it.effect("readers remove stale rows of completed requests and rows whose message is gone", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const command = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.provideService(effect, ClickhouseClient.ClientMethod, "command")
+            const completed = yield* makeRequest({ entityId: "1" })
+            const orphan = yield* makeRequest({ entityId: "2" })
+            yield* storage.saveRequest(completed)
+            yield* storage.saveReply(yield* makeReply(completed))
+            yield* storage.saveRequest(orphan)
+            // An exit save that stopped before removing its pending row, long ago.
+            yield* command(sql`
+              INSERT INTO cluster_pending (id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, last_reply_id, last_read, claim, enqueued_at)
+              SELECT id, request_id, rowid, kind, message_id, shard_id, entity_type, entity_id, deliver_at, NULL, NULL, '',
+                now64(3) - INTERVAL 1 HOUR
+              FROM cluster_messages WHERE id = ${sql.literal(String(completed.envelope.requestId))}
+            `)
+            // A pending row whose message a racing clearAddress removed.
+            yield* command(
+              sql`DELETE FROM cluster_messages WHERE id = ${sql.literal(String(orphan.envelope.requestId))}`
+            )
+
+            expect(yield* storage.unprocessedMessages([completed.envelope.address.shardId])).toHaveLength(0)
+            expect(yield* sql`SELECT id FROM cluster_pending`).toHaveLength(0)
+          }))
+
+        it.effect("a clearAddress that stopped part way finishes when retried", () =>
+          Effect.gen(function*() {
+            yield* backend.truncate
+            const sql = yield* SqlClient.SqlClient
+            const storage = yield* MessageStorage.MessageStorage
+            const command = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+              Effect.provideService(effect, ClickhouseClient.ClientMethod, "command")
+            const request = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 9 }) })
+            yield* storage.saveRequest(request)
+            yield* storage.saveReply(yield* makeChunkReply(request))
+            yield* storage.saveReply(yield* makeReply(request))
+            // The first steps ran, the messages are still there.
+            yield* command(sql`TRUNCATE TABLE cluster_pending`)
+            yield* command(sql`TRUNCATE TABLE cluster_exits`)
+
+            yield* storage.clearAddress(request.envelope.address)
+            for (const table of ["messages", "replies", "message_ids", "pending", "exits"]) {
+              expect(yield* sql`SELECT 1 FROM ${sql(`cluster_${table}`)}`, table).toHaveLength(0)
+            }
+            const again = yield* makeRequest({ rpc: StreamRpc, payload: StreamRpc.payloadSchema.make({ id: 9 }) })
+            expect((yield* storage.saveRequest(again))._tag).toEqual("Success")
           }))
 
         it.effect("a clearReplies stopped before removing the exit keeps the request hidden", () =>
