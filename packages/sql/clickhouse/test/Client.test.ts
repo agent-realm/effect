@@ -165,6 +165,7 @@ describe("ClickhouseClient", { concurrent: false }, () => {
   it.effect("creates the ledger without sqlite ddl or BEGIN", () =>
     Effect.gen(function*() {
       connectImmediately = true
+      commandCalls.length = 0
       const queries: Array<string> = []
       queryImpl = (options) => {
         queries.push(String(options.query))
@@ -177,9 +178,39 @@ describe("ClickhouseClient", { concurrent: false }, () => {
         })
       }).pipe(Effect.provideService(SqlClient.SqlClient, client))
 
+      // DDL and the history insert run as commands, reads as queries.
+      const commands = commandCalls.map((call) => String(call.query))
       assert.deepStrictEqual(applied, [[1, "init"]])
-      assert.match(queries[0] ?? "", /ENGINE = MergeTree/)
-      assert.notMatch(queries.join("\n"), /PRIMARY KEY NOT NULL|BEGIN/)
+      assert.match(commands[0] ?? "", /ENGINE = MergeTree/)
+      assert.notMatch([...commands, ...queries].join("\n"), /PRIMARY KEY NOT NULL|BEGIN/)
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => {
+        queryImpl = undefined
+      })),
+      Effect.provide(Reactivity.layer)
+    ))
+
+  it.effect("fails a migration with a typed MigrationError and does not record it", () =>
+    Effect.gen(function*() {
+      connectImmediately = true
+      commandCalls.length = 0
+      queryImpl = () => Promise.resolve({ text: () => Promise.resolve(`{"data":[]}`) })
+      const client = yield* ClickhouseClient.make({ url: "http://localhost:8123" })
+      const error = yield* Effect.flip(
+        ClickhouseMigrator.run({
+          loader: ClickhouseMigrator.fromRecord({
+            "1_init": Effect.void,
+            "2_bad": Effect.fail("boom")
+          })
+        }).pipe(Effect.provideService(SqlClient.SqlClient, client))
+      )
+
+      assert(error._tag === "MigrationError")
+      assert.strictEqual(error.kind, "Failed")
+      assert.strictEqual(error.cause, "boom")
+      // Only the migration that succeeded is in the history table.
+      const recorded = commandCalls.filter((call) => /^\s*INSERT INTO/.test(String(call.query)))
+      assert.strictEqual(recorded.length, 1)
     }).pipe(
       Effect.ensuring(Effect.sync(() => {
         queryImpl = undefined

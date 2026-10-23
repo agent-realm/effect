@@ -177,16 +177,15 @@ const makeStorage = Effect.fnUntraced(function*(options: {
   // Machine ids are allocated like a serial column: the next id after the
   // highest ever handed out, claimed with a strict insert so two runners
   // registering at once cannot get the same one.
-  const allocateMachineId = (address: string) =>
-    Effect.gen(function*() {
-      const [[next]] = yield* sql`SELECT max(machine_id) + 1 FROM ${machineIdsTableSql}`.values
-      const machineId = Number(next)
-      yield* strict(sql`
-        INSERT INTO ${machineIdsTableSql} (machine_id, address)
-        SELECT ${client.param("UInt32", machineId)}, ${address}
-      `)
-      return machineId
-    }).pipe(retryOnConflict)
+  const allocateMachineId = Effect.fnUntraced(function*(address: string) {
+    const [[next]] = yield* sql`SELECT max(machine_id) + 1 FROM ${machineIdsTableSql}`.values
+    const machineId = Number(next)
+    yield* strict(sql`
+      INSERT INTO ${machineIdsTableSql} (machine_id, address)
+      SELECT ${client.param("UInt32", machineId)}, ${address}
+    `)
+    return machineId
+  }, retryOnConflict)
 
   const register = (address: string, runner: string, healthy: boolean): Effect.Effect<number, SqlError> =>
     Effect.gen(function*() {

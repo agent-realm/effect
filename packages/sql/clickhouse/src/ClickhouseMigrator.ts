@@ -69,8 +69,8 @@ const loadMigration = ([id, name, load]: Migrator.ResolvedMigration) =>
  *
  * The history table is a `MergeTree` table named by `table` (default
  * `effect_sql_migrations`). Each migration is recorded after it succeeds.
- * Failures inside a migration become `MigrationError` defects of kind
- * `"Failed"`, as with the shared migrator.
+ * A migration that fails ends the run with a `MigrationError` of kind
+ * `"Failed"`, as with the shared migrator, and is not recorded.
  *
  * @stability unstable
  * @category running
@@ -89,18 +89,18 @@ export const run = <R2 = never>(
 
     yield* asCommand(sql`
       CREATE TABLE IF NOT EXISTS ${tableSql} (
-        migration_id UInt32,
-        created_at DateTime64(3) DEFAULT now64(3),
+        migration_id Int32,
+        created_at DateTime DEFAULT now(),
         name String
       )
       ENGINE = MergeTree
       ORDER BY migration_id
     `)
 
-    const [[latestMigrationId], current] = yield* Effect.all([
+    const [latestMigrationId, current] = yield* Effect.all([
       Effect.map(
         sql`SELECT max(migration_id) FROM ${tableSql}`.values,
-        (rows) => rows.map((row) => Number(row[0]))
+        (rows) => Number(rows[0]?.[0] ?? 0)
       ),
       loader
     ])
@@ -120,14 +120,12 @@ export const run = <R2 = never>(
       }
       const effect = yield* loadMigration(resolved)
       yield* Effect.logDebug(`Running migration`).pipe(
-        Effect.andThen(Effect.catch(effect, (error: unknown) =>
-          Effect.die(
-            new Migrator.MigrationError({
-              cause: error,
-              kind: "Failed",
-              message: `Migration "${id}_${name}" failed`
-            })
-          ))),
+        Effect.andThen(Effect.mapError(effect, (error) =>
+          new Migrator.MigrationError({
+            cause: error,
+            kind: "Failed",
+            message: `Migration "${id}_${name}" failed`
+          }))),
         Effect.annotateLogs("migration_id", String(id)),
         Effect.annotateLogs("migration_name", name),
         Effect.withSpan(`Migrator ${id}_${name}`)

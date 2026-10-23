@@ -600,8 +600,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       )
 
   const encoded: MessageStorage.Encoded = {
-    saveEnvelope: ({ deliverAt, envelope, primaryKey }) =>
-      Effect.gen(function*() {
+    saveEnvelope: Effect.fnUntraced(
+      function*({ deliverAt, envelope, primaryKey }) {
         if (primaryKey === null) {
           const row = envelopeToRow(envelope, null, deliverAt)
           if (envelope._tag === "Request" && (yield* alreadySaved(row.id))) {
@@ -647,14 +647,14 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         }
         yield* dequeue([row.id])
         return yield* duplicate(owner)
-      }).pipe(
-        quoted,
-        PersistenceError.refail,
-        withTracerDisabled
-      ),
+      },
+      quoted,
+      PersistenceError.refail,
+      withTracerDisabled
+    ),
 
-    saveReply: (reply) =>
-      Effect.gen(function*() {
+    saveReply: Effect.fnUntraced(
+      function*(reply) {
         const row = replyToRow(reply)
         const requestId = String(reply.requestId)
         if (reply._tag === "Chunk") {
@@ -683,11 +683,11 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
           return yield* Effect.fail(new ExitAlreadySaved(requestId))
         }
         yield* retryOnConflict(strict(sql`ALTER TABLE ${pendingTable} DELETE WHERE request_id = ${int64(requestId)}`))
-      }).pipe(
-        quoted,
-        PersistenceError.refail,
-        withTracerDisabled
-      ),
+      },
+      quoted,
+      PersistenceError.refail,
+      withTracerDisabled
+    ),
 
     // The exit is removed last. Until then the request stays complete and the
     // messages requeued for it stay hidden, so stopping part way loses nothing.
@@ -760,18 +760,18 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       withTracerDisabled
     ),
 
-    requestIdForPrimaryKey: (primaryKey) =>
-      Effect.gen(function*() {
+    requestIdForPrimaryKey: Effect.fnUntraced(
+      function*(primaryKey) {
         const owner = yield* requestIdForMessageId(yield* messageIdForPrimaryKey(primaryKey))
         // A key whose request was removed by `clearAddress` names no request.
         return owner !== undefined && (yield* hasMessage(owner))
           ? Option.some(Snowflake.Snowflake(owner))
           : Option.none()
-      }).pipe(
-        quoted,
-        PersistenceError.refail,
-        withTracerDisabled
-      ),
+      },
+      quoted,
+      PersistenceError.refail,
+      withTracerDisabled
+    ),
 
     // Exit replies count only when `exits` points at them; chunk replies are
     // returned until they are acknowledged.
@@ -834,8 +834,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     // A save racing the clear can still leave a pending row whose message is
     // gone, which readers drop, or a key whose request is gone, which the
     // next save of that key takes over.
-    clearAddress: (address) =>
-      Effect.gen(function*() {
+    clearAddress: Effect.fnUntraced(
+      function*(address) {
         const rows = yield* sql`
           SELECT DISTINCT id, request_id, message_id FROM ${messagesTable}
           WHERE entity_type = ${address.entityType} AND entity_id = ${address.entityId}
@@ -865,13 +865,16 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
             `)),
             Effect.as([])
           ))
-        yield* forChunks(messageIds, idChunk, (chunk) =>
-          command(sql`DELETE FROM ${messagesTable} WHERE id IN ${ids(chunk)}`).pipe(Effect.as([])))
-      }).pipe(
-        quoted,
-        PersistenceError.refail,
-        withTracerDisabled
-      ),
+        yield* forChunks(
+          messageIds,
+          idChunk,
+          (chunk) => command(sql`DELETE FROM ${messagesTable} WHERE id IN ${ids(chunk)}`).pipe(Effect.as([]))
+        )
+      },
+      quoted,
+      PersistenceError.refail,
+      withTracerDisabled
+    ),
 
     resetShards: (shardIds) =>
       resetClaims(sql`shard_id IN ${strings(shardIds)}`).pipe(
@@ -1088,24 +1091,23 @@ export interface StorageOptions {
 
 // Several runners may archive at once: archive inserts collapse, and Keeper
 // deletes are conditional.
-const startArchiving = (options: StorageOptions) =>
-  Effect.gen(function*() {
-    const client = yield* ClickhouseClient.ClickhouseClient
-    const retention = options.retention ?? Duration.hours(1)
-    const drain: Effect.Effect<void, SqlError> = Effect.suspend(() =>
-      Effect.flatMap(
-        archivePass({ client, prefix: options.prefix, retention }),
-        (result) => result.archived + result.compensated >= idChunk ? drain : Effect.void
-      )
+const startArchiving = Effect.fnUntraced(function*(options: StorageOptions) {
+  const client = yield* ClickhouseClient.ClickhouseClient
+  const retention = options.retention ?? Duration.hours(1)
+  const drain: Effect.Effect<void, SqlError> = Effect.suspend(() =>
+    Effect.flatMap(
+      archivePass({ client, prefix: options.prefix, retention }),
+      (result) => result.archived + result.compensated >= idChunk ? drain : Effect.void
     )
-    yield* Effect.sleep(options.archiveInterval ?? Duration.minutes(5)).pipe(
-      Effect.andThen(drain.pipe(
-        Effect.catchCause((cause) => Effect.logWarning("ClickhouseMessageStorage: archive pass failed", cause))
-      )),
-      Effect.forever,
-      Effect.forkScoped
-    )
-  })
+  )
+  yield* Effect.sleep(options.archiveInterval ?? Duration.minutes(5)).pipe(
+    Effect.andThen(drain.pipe(
+      Effect.catchCause((cause) => Effect.logWarning("ClickhouseMessageStorage: archive pass failed", cause))
+    )),
+    Effect.forever,
+    Effect.forkScoped
+  )
+})
 
 /**
  * Provides ClickHouse-backed `MessageStorage` with a custom table prefix,

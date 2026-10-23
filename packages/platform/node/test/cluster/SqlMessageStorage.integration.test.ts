@@ -80,13 +80,12 @@ const sqlBackend = (
     const sql = yield* SqlClient.SqlClient
     return yield* sql`SELECT processed FROM cluster_messages ORDER BY rowid`
   }),
-  messageState: (id) =>
-    Effect.gen(function*() {
-      const sql = yield* SqlClient.SqlClient
-      return yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${id}`.pipe(
-        Effect.provideService(SqlClient.SafeIntegers, true)
-      )
-    }),
+  messageState: Effect.fnUntraced(function*(id) {
+    const sql = yield* SqlClient.SqlClient
+    return yield* sql`SELECT processed, last_reply_id FROM cluster_messages WHERE id = ${id}`.pipe(
+      Effect.provideService(SqlClient.SafeIntegers, true)
+    )
+  }),
   storedMessageIds: Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_messages`
@@ -133,8 +132,8 @@ const clickhouseBackend: Backend = {
       ORDER BY rowid
     `
   }),
-  messageState: (id) =>
-    Effect.gen(function*() {
+  messageState: Effect.fnUntraced(
+    function*(id) {
       const sql = yield* SqlClient.SqlClient
       const pending = yield* sql<{ last_reply_id: string | null }>`
         SELECT last_reply_id FROM cluster_pending WHERE id = ${sql.literal(id)}
@@ -146,10 +145,10 @@ const clickhouseBackend: Backend = {
         processed: pending.length === 0 || exits.length > 0,
         last_reply_id: exits[0]?.reply_id ?? pending[0]?.last_reply_id ?? null
       }
-    }).pipe(
-      // Read Snowflake ids exactly, as strings.
-      Effect.provideService(ClickhouseClient.ClickhouseSettings, { output_format_json_quote_64bit_integers: 1 })
-    ),
+    },
+    // Read Snowflake ids exactly, as strings.
+    Effect.provideService(ClickhouseClient.ClickhouseSettings, { output_format_json_quote_64bit_integers: 1 })
+  ),
   storedMessageIds: Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     const rows = yield* sql<{ message_id: string }>`SELECT message_id FROM cluster_message_ids`
@@ -515,18 +514,16 @@ describe("SqlMessageStorage", () => {
           }))
 
         // Archiving: a pass with no retention moves every completed request.
-        const archiveNow = (hooks?: ArchiveHooks) =>
-          Effect.gen(function*() {
-            // The ClickHouse client layer provides the same client as `SqlClient`.
-            const client = (yield* SqlClient.SqlClient) as ClickhouseClient.ClickhouseClient
-            return yield* archivePass({ client, retention: 0, hooks })
-          })
-        const count = (query: string) =>
-          Effect.gen(function*() {
-            const sql = yield* SqlClient.SqlClient
-            const rows = yield* sql.unsafe<{ n: string }>(`SELECT toString(count()) AS n FROM ${query}`)
-            return Number(rows[0].n)
-          })
+        const archiveNow = Effect.fnUntraced(function*(hooks?: ArchiveHooks) {
+          // The ClickHouse client layer provides the same client as `SqlClient`.
+          const client = (yield* SqlClient.SqlClient) as ClickhouseClient.ClickhouseClient
+          return yield* archivePass({ client, retention: 0, hooks })
+        })
+        const count = Effect.fnUntraced(function*(query: string) {
+          const sql = yield* SqlClient.SqlClient
+          const rows = yield* sql.unsafe<{ n: string }>(`SELECT toString(count()) AS n FROM ${query}`)
+          return Number(rows[0].n)
+        })
 
         it.effect("an archived exit still resumes", () =>
           Effect.gen(function*() {
