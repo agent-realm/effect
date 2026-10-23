@@ -176,16 +176,23 @@ const makeStorage = Effect.fnUntraced(function*(options: {
 
   // Machine ids are allocated like a serial column: the next id after the
   // highest ever handed out, claimed with a strict insert so two runners
-  // registering at once cannot get the same one.
-  const allocateMachineId = Effect.fnUntraced(function*(address: string) {
-    const [[next]] = yield* sql`SELECT max(machine_id) + 1 FROM ${machineIdsTableSql}`.values
-    const machineId = Number(next)
-    yield* strict(sql`
-      INSERT INTO ${machineIdsTableSql} (machine_id, address)
-      SELECT ${client.param("UInt32", machineId)}, ${address}
-    `)
-    return machineId
-  }, retryOnConflict)
+  // registering at once cannot get the same one. A conflict means another
+  // registration claimed that id, so a registration loses at most one round
+  // per concurrent registration. Snowflake ids tell at most 1024 machine ids
+  // apart, so 1024 rounds cover any useful number of runners starting at
+  // once, while a conflict that never clears still fails.
+  const allocateMachineId = Effect.fnUntraced(
+    function*(address: string) {
+      const [[next]] = yield* sql`SELECT max(machine_id) + 1 FROM ${machineIdsTableSql}`.values
+      const machineId = Number(next)
+      yield* strict(sql`
+        INSERT INTO ${machineIdsTableSql} (machine_id, address)
+        SELECT ${client.param("UInt32", machineId)}, ${address}
+      `)
+      return machineId
+    },
+    (effect) => Effect.retry(effect, { while: KeeperMap.isConflict, times: 1024 })
+  )
 
   const register = (address: string, runner: string, healthy: boolean): Effect.Effect<number, SqlError> =>
     Effect.gen(function*() {
