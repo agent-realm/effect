@@ -37,6 +37,7 @@ import type { Fragment } from "../sql/Statement.ts"
 import { PersistenceError } from "./ClusterError.ts"
 import type * as EntityAddress from "./EntityAddress.ts"
 import type * as Envelope from "./Envelope.ts"
+import { rejectClickhouse } from "./internal/sqlDialect.ts"
 import * as MessageStorage from "./MessageStorage.ts"
 import { SaveResultEncoded } from "./MessageStorage.ts"
 import type * as Reply from "./Reply.ts"
@@ -84,6 +85,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     readonly prefix?: string | undefined
   } | undefined
 ) {
+  yield* rejectClickhouse("SqlMessageStorage", "ClickhouseMessageStorage")
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
   const crypto = yield* Crypto.Crypto
   const prefix = options?.prefix ?? "cluster"
@@ -277,13 +279,42 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
   const sqlFalse = sql.literal(supportsBooleans ? "FALSE" : "0")
   const sqlTrue = sql.literal(supportsBooleans ? "TRUE" : "1")
 
+  // Read SQLite IDs as text to avoid rounding on number-returning drivers
+  // such as Durable Objects.
+  const idsAsText = sql.onDialectOrElse({
+    sqlite: () => true,
+    orElse: () => false
+  })
+  const idAs = (column: string, alias: string) =>
+    idsAsText ? `CAST(${column} AS TEXT) AS ${alias}` : `${column} AS ${alias}`
+  const replyJoinColumns = "r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence"
+  const messageColumns = idsAsText
+    ? `${idAs("m.id", "id")}, m.message_id, m.shard_id, m.entity_type, m.entity_id, m.kind, m.tag, m.payload, ` +
+      `m.headers, m.trace_id, m.span_id, m.sampled, m.processed, ${idAs("m.request_id", "request_id")}, ` +
+      `${idAs("m.reply_id", "reply_id")}, ${idAs("m.last_reply_id", "last_reply_id")}, m.last_read, m.deliver_at`
+    : "m.*"
+
+  const idColumn = sql.literal(idAs("id", "id"))
+  const replyColumns = sql.literal(
+    `${idAs("id", "id")}, kind, ${idAs("request_id", "request_id")}, payload, sequence`
+  )
+  const duplicateColumns = sql.literal(
+    `${idAs("m.id", "id")}, ${idAs("r.id", "reply_id")}, ${replyJoinColumns}`
+  )
+  const messageJoinColumns = sql.literal(
+    `${messageColumns}, ${idAs("r.id", "reply_reply_id")}, ${replyJoinColumns}`
+  )
+
   const selectByMessageId = (message_id: string): Effect.Effect<ReadonlyArray<Row>, SqlError> =>
     sql`
-      SELECT m.id, r.id as reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
+      SELECT ${duplicateColumns}
       FROM ${messagesTableSql} m
       LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
       WHERE m.message_id = ${message_id}
     `
+  // an insert that returned no rows hit an existing message_id
+  const selectUnlessInserted = (message_id: string) => (inserted: ReadonlyArray<unknown>) =>
+    inserted.length > 0 ? Effect.succeed([]) : selectByMessageId(message_id)
 
   const insertEnvelope: (
     row: MessageRow,
@@ -294,11 +325,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         INSERT INTO ${messagesTableSql} ${sql.insert(row)}
         ON CONFLICT (message_id) DO NOTHING
         RETURNING id
-      `.pipe(Effect.flatMap((rows) => {
-        // inserted a new row
-        if (rows.length > 0) return Effect.succeed([])
-        return selectByMessageId(message_id)
-      })),
+      `.pipe(Effect.flatMap(selectUnlessInserted(message_id))),
     mysql: () => (row, message_id) =>
       Effect.flatMap(
         sql`INSERT IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`.raw,
@@ -316,37 +343,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
         ON target.message_id = source.message_id
         WHEN NOT MATCHED THEN
           INSERT ${sql.insert(row)}
-        OUTPUT
-          inserted.id,
-          CASE
-            WHEN inserted.id IS NULL THEN (
-              SELECT r.id, r.kind, r.payload
-              FROM ${repliesTableSql} r
-              WHERE r.id = target.last_reply_id
-            )
-          END as reply_id,
-          CASE
-            WHEN inserted.id IS NULL THEN (
-              SELECT r.kind
-              FROM ${repliesTableSql} r
-              WHERE r.id = target.last_reply_id
-            )
-          END as reply_kind,
-          CASE
-            WHEN inserted.id IS NULL THEN (
-              SELECT r.payload
-              FROM ${repliesTableSql} r
-              WHERE r.id = target.last_reply_id
-            )
-          END as reply_payload,
-          CASE
-            WHEN inserted.id IS NULL THEN (
-              SELECT r.sequence
-              FROM ${repliesTableSql} r
-              WHERE r.id = target.last_reply_id
-            )
-          END as reply_sequence;
-      `,
+        OUTPUT inserted.id;
+      `.pipe(Effect.flatMap(selectUnlessInserted(message_id))),
     orElse: () => (row, message_id) =>
       selectByMessageId(message_id).pipe(
         Effect.tap(sql`INSERT OR IGNORE INTO ${messagesTableSql} ${sql.insert(row)}`),
@@ -374,8 +372,14 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     orElse: () => (s: string) => `'${s}'`
   })
   const forUpdate = sql.onDialectOrElse({
+    mssql: () => sql.literal(""),
     sqlite: () => sql.literal(""),
     orElse: () => sql.literal("FOR UPDATE")
+  })
+  // mssql locks claimed rows with a table hint instead of FOR UPDATE
+  const updateLock = sql.onDialectOrElse({
+    mssql: () => sql.literal("WITH (UPDLOCK)"),
+    orElse: () => sql.literal("")
   })
 
   const emptyFragment = sql.literal("")
@@ -459,8 +463,8 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       `,
     orElse: () => (shardIds: ReadonlyArray<string>, now: number, filters: UnprocessedFilters) =>
       sql<MessageJoinRow>`
-        SELECT m.*, r.id as reply_reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
-        FROM ${messagesTableSql} m
+        SELECT ${messageJoinColumns}
+        FROM ${messagesTableSql} m ${updateLock}
         LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
         WHERE m.shard_id IN (${sql.literal(shardIds.map(wrapString).join(","))})
         ${filters.addressFilter}
@@ -630,11 +634,11 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     requestIdForPrimaryKey: (primaryKey) =>
       messageIdForPrimaryKey(primaryKey).pipe(
         Effect.flatMap((messageId) =>
-          sql<{ id: string | bigint }>`SELECT id FROM ${messagesTableSql} WHERE message_id = ${messageId}`
+          sql<{ id: string | bigint }>`SELECT ${idColumn} FROM ${messagesTableSql} WHERE message_id = ${messageId}`
         ),
         Effect.flatMap((rows) =>
           rows.length === 0 && mayHaveLegacyRow(primaryKey)
-            ? sql<{ id: string | bigint }>`SELECT id FROM ${messagesTableSql} WHERE message_id = ${primaryKey}`
+            ? sql<{ id: string | bigint }>`SELECT ${idColumn} FROM ${messagesTableSql} WHERE message_id = ${primaryKey}`
             : Effect.succeed(rows)
         ),
         Effect.map((rows) => Option.map(Option.fromNullishOr(rows[0]?.id), Snowflake.Snowflake)),
@@ -649,7 +653,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
       // - the kind is WithExit
       // - or the kind is Chunk and has not been acked yet
       sql<ReplyRow>`
-        SELECT id, kind, request_id, payload, sequence
+        SELECT ${replyColumns}
         FROM ${repliesTableSql}
         WHERE request_id IN (${sql.literal(requestIds.join(","))})
         AND (
@@ -669,7 +673,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
 
     repliesForUnfiltered: (requestIds) =>
       sql<ReplyRow>`
-        SELECT id, kind, request_id, payload, sequence
+        SELECT ${replyColumns}
         FROM ${repliesTableSql}
         WHERE request_id IN (${sql.literal(requestIds.join(","))})
         ORDER BY rowid ASC
@@ -705,7 +709,7 @@ const makeEncodedStorage = Effect.fnUntraced(function*(
     unprocessedMessagesById(ids, now) {
       const idArr = Array.from(ids, (id) => String(id))
       return sql<MessageRow & ReplyJoinRow>`
-        SELECT m.*, r.id as reply_reply_id, r.kind as reply_kind, r.payload as reply_payload, r.sequence as reply_sequence
+        SELECT ${messageJoinColumns}
         FROM ${messagesTableSql} m
         LEFT JOIN ${repliesTableSql} r ON r.id = m.last_reply_id
         WHERE m.id IN (${sql.literal(idArr.join(","))})
@@ -840,6 +844,8 @@ export const migrations = (options?: {
       const messagesTableSql = sql(messagesTable)
       const repliesTableSql = sql(repliesTable)
 
+      // mssql UNIQUE constraints treat NULLs as equal, so nullable keys use
+      // filtered unique indexes instead
       yield* sql.onDialectOrElse({
         mssql: () =>
           sql`
@@ -853,8 +859,8 @@ export const migrations = (options?: {
               entity_id VARCHAR(255) NOT NULL,
               kind INT NOT NULL,
               tag VARCHAR(50),
-              payload TEXT,
-              headers TEXT,
+              payload NVARCHAR(MAX),
+              headers NVARCHAR(MAX),
               trace_id VARCHAR(32),
               span_id VARCHAR(16),
               sampled BIT,
@@ -864,7 +870,7 @@ export const migrations = (options?: {
               last_reply_id BIGINT,
               last_read DATETIME,
               deliver_at BIGINT,
-              UNIQUE (message_id)
+              INDEX ${sql(messagesTable + "_message_id_idx")} UNIQUE (message_id) WHERE message_id IS NOT NULL
             )
           `,
         mysql: () =>
@@ -967,17 +973,16 @@ export const migrations = (options?: {
             CREATE INDEX ${sql(requestIdLookupIndex)}
             ON ${messagesTableSql} (request_id);
           `.unprepared.pipe(Effect.ignore),
-        pg: () =>
-          Effect.gen(function*() {
-            yield* sql`
+        pg: Effect.fnUntraced(function*() {
+          yield* sql`
               CREATE INDEX IF NOT EXISTS ${sql(shardLookupIndex)}
               ON ${messagesTableSql} (shard_id, processed, last_read, deliver_at)
             `
-            yield* sql`
+          yield* sql`
               CREATE INDEX IF NOT EXISTS ${sql(requestIdLookupIndex)}
               ON ${messagesTableSql} (request_id)
             `
-          }),
+        }),
         orElse: () =>
           // sqlite
           Effect.all([
@@ -1001,11 +1006,11 @@ export const migrations = (options?: {
               rowid BIGINT IDENTITY(1,1),
               kind INT,
               request_id BIGINT NOT NULL,
-              payload TEXT NOT NULL,
+              payload NVARCHAR(MAX) NOT NULL,
               sequence INT,
               acked BIT NOT NULL DEFAULT 0,
-              CONSTRAINT ${sql(repliesTable + "_one_exit")} UNIQUE (request_id, kind),
-              CONSTRAINT ${sql(repliesTable + "_sequence")} UNIQUE (request_id, sequence)
+              INDEX ${sql(repliesTable + "_one_exit")} UNIQUE (request_id, kind) WHERE kind IS NOT NULL,
+              INDEX ${sql(repliesTable + "_sequence")} UNIQUE (request_id, sequence) WHERE sequence IS NOT NULL
             )
           `,
         mysql: () =>
@@ -1123,10 +1128,13 @@ export const migrations = (options?: {
 const runMessageMigrations = (options?: {
   readonly prefix?: string | undefined
 }): Effect.Effect<void, never, SqlClient.SqlClient> =>
-  Migrator.make({})({
-    loader: migrations(options),
-    table: `${options?.prefix ?? "cluster"}_migrations`
-  }).pipe(Effect.asVoid, Effect.orDie)
+  Effect.andThen(
+    rejectClickhouse("SqlMessageStorage", "ClickhouseMessageStorage"),
+    Migrator.make({})({
+      loader: migrations(options),
+      table: `${options?.prefix ?? "cluster"}_migrations`
+    }).pipe(Effect.asVoid, Effect.orDie)
+  )
 
 /**
  * Runs the SQL message storage migrations without providing storage.

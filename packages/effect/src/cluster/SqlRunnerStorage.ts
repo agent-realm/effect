@@ -6,6 +6,8 @@
  * shard. This module migrates the required runner and lock tables, supports an
  * optional table prefix, uses advisory locks for PostgreSQL and MySQL when
  * enabled, and provides constructors and layers for the storage service.
+ * PGlite clients always use lock table rows on the shared client, so the
+ * storage never holds their only connection.
  *
  * `layer`, `layerWith`, and `make` run the migrations before building the
  * storage. To run migrations with a different connection, such as a schema
@@ -30,6 +32,7 @@ import type * as Statement from "../sql/Statement.ts"
 import { PersistenceError } from "./ClusterError.ts"
 import { ResourceRef } from "./internal/resourceRef.ts"
 import { effectiveInterval } from "./internal/shardLock.ts"
+import { rejectClickhouse } from "./internal/sqlDialect.ts"
 import * as RunnerStorage from "./RunnerStorage.ts"
 import * as ShardId from "./ShardId.ts"
 import * as ShardingConfig from "./ShardingConfig.ts"
@@ -50,12 +53,17 @@ const postgresLockNamespace = (prefix: string): number => {
 const makeStorage = Effect.fnUntraced(function*(options: {
   readonly prefix?: string | undefined
 }) {
+  yield* rejectClickhouse("SqlRunnerStorage", "ClickhouseRunnerStorage")
   const config = yield* ShardingConfig.ShardingConfig
   const shardGroups = ShardingConfig.shardGroupConfig(config)
   const availableShardGroups = Array.from(shardGroups.available)
-  const disableAdvisoryLocks = config.shardLockDisableAdvisory
   const lockOperationInterval = effectiveInterval(config)
   const sql = (yield* SqlClient.SqlClient).withoutTransforms()
+  // PGlite runs every statement on one session, so advisory locks are shared by
+  // every user of the client and a reserved connection would block all other
+  // statements. Use table leases on the shared client instead.
+  const singleSession = sql.driver === "pglite"
+  const disableAdvisoryLocks = config.shardLockDisableAdvisory || singleSession
   const layerScope = yield* Effect.scope
   const prefix = options?.prefix ?? "cluster"
   const table = (name: string) => `${prefix}_${name}`
@@ -65,7 +73,7 @@ const makeStorage = Effect.fnUntraced(function*(options: {
 
   // Keep all PostgreSQL and MySQL shard-lock operations on a rebuildable
   // reserved connection, including when advisory locks are disabled.
-  const acquireLockConn = sql.onDialectOrElse({
+  const acquireLockConn = singleSession ? undefined : sql.onDialectOrElse({
     pg: () =>
       Effect.fnUntraced(function*(scope: Scope.Scope) {
         const conn = yield* Effect.orDie(sql.reserve).pipe(
@@ -667,8 +675,8 @@ const makeStorage = Effect.fnUntraced(function*(options: {
  * permission to create tables. When `prefix` is omitted, `make` uses the
  * `cluster` prefix, creating `cluster_runners`, `cluster_locks`, and the
  * `cluster_runner_migrations` history table. PostgreSQL and MySQL use advisory
- * locks unless `ShardingConfig.shardLockDisableAdvisory` is enabled; other
- * dialects use rows in the locks table.
+ * locks unless `ShardingConfig.shardLockDisableAdvisory` is enabled or the
+ * client is PGlite; other dialects and PGlite use rows in the locks table.
  *
  * **Gotchas**
  *
@@ -810,11 +818,14 @@ export const migrations = (options: {
 const runRunnerMigrations = (options: {
   readonly prefix?: string | undefined
 }): Effect.Effect<void, never, SqlClient.SqlClient> =>
-  Migrator.make({})({
-    loader: migrations(options),
-    // Message and runner migration ids overlap, so keep separate histories.
-    table: `${options.prefix ?? "cluster"}_runner_migrations`
-  }).pipe(Effect.asVoid, Effect.orDie)
+  Effect.andThen(
+    rejectClickhouse("SqlRunnerStorage", "ClickhouseRunnerStorage"),
+    Migrator.make({})({
+      loader: migrations(options),
+      // Message and runner migration ids overlap, so keep separate histories.
+      table: `${options.prefix ?? "cluster"}_runner_migrations`
+    }).pipe(Effect.asVoid, Effect.orDie)
+  )
 
 /**
  * Runs the SQL runner storage migrations without providing storage.

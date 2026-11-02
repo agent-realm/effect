@@ -38,6 +38,17 @@ const runCommand = Effect.fnUntraced(
   }
 )
 
+describe("CliOutput.displayWidth", () => {
+  it("measures terminal cells", () => {
+    assert.strictEqual(CliOutput.displayWidth(""), 0)
+    assert.strictEqual(CliOutput.displayWidth("file"), 4)
+    assert.strictEqual(CliOutput.displayWidth("ファイル"), 8)
+    assert.strictEqual(CliOutput.displayWidth("e\u0301"), 1)
+    assert.strictEqual(CliOutput.displayWidth("1️⃣"), 2)
+    assert.strictEqual(CliOutput.displayWidth("\u001B[31mファイル\u001B[0m"), 8)
+  })
+})
+
 describe("Command help output", () => {
   it("marks omittable flags as not required in structured help", () => {
     const command = Command.make("app", {
@@ -48,6 +59,14 @@ describe("Command help output", () => {
     const help = toImpl(command).buildHelpDoc(["app"])
 
     assert.deepStrictEqual(help.flags.map((flag) => flag.required), [true, false, false])
+  })
+
+  it("renders the type of a flag with an optional value as optional", () => {
+    const command = Command.make("app", {
+      watch: Flag.Literals("watch", ["first-failure", "until-done"]).pipe(Flag.withOptionalValue("first-failure"))
+    })
+    const help = toImpl(command).buildHelpDoc(["app"])
+    assert.deepStrictEqual(help.flags.map((flag) => flag.type), ["[=choice]"])
   })
 
   it("marks omittable arguments as not required in structured help", () => {
